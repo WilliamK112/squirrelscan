@@ -69,6 +69,85 @@ the page's lifetime, which in JavaScriptCore pins the whole page as UTF-16.
 Remaining per-page term after these: about 80 KB of real values the site pass
 reads, flat across 50 / 100 / 150 pages.
 
+## Rules-phase scaling, and one asymptotic fix with no measurable win
+
+[#1910](https://github.com/squirrelscan/repo/issues/1910) reported site rules at
+n^2.0 (4 s at 400 pages to 687 s at 5,000) and page rules at n^1.6. Re-measured
+on a quiet machine, with the content store isolated, each measurement in its own
+child process, and the two rules that reach the network excluded
+(`security/http-to-https` probes over HTTP with staggered sleeps and was 508 ms
+of a 518 ms site phase; the soft-404 confirmation pass re-fetches candidates).
+Mixed estate at #1910's template shares, 14.2 KB mean, per page in milliseconds:
+
+| pages | universe | page rules | site query | site rules | v1 load+hydrate | v1 rules | parsePageRecord |
+|---|---|---|---|---|---|---|---|
+| 400 | 0.33 | 6.95 | 0.06 | 0.17 | 0.20 | 6.44 | 0.67 |
+| 1,000 | 0.35 | 6.76 | 0.07 | 0.16 | 0.17 | 6.74 | 0.63 |
+| 2,500 | 0.32 | 7.60 | 0.08 | 0.16 | 0.19 | 7.86 | 0.59 |
+
+Slopes across 6.3x: page rules n^1.05, site rules n^0.97, parsePageRecord n^0.93,
+universe n^0.99, v1 rules n^1.11. Nothing quadratic. At 102 KB mean over 400 to
+1,600 the exponents hold. #1910's own caveat explains its numbers: its 2,500 row
+was 589 s wall against 360 s CPU and its 5,000 row 2,236 s against 1,023 s, on a
+box doing 150 MB/s of swap at load average 13.
+
+`integrity/template-discontinuity` did contain a genuinely quadratic structure:
+on the v1 path it looked each outlier's page up with `pages.find(...)`, so with
+outlier share `f` that is `f·n` scans of `n` pages. Replaced with a lazily built
+first-wins map ([#254](https://github.com/squirrelscan/squirrelscan/pull/254)).
+**The change buys nothing measurable at any size this fixture can reach**, and
+this row exists to say so:
+
+| outlier share | pages | before | after |
+|---|---|---|---|
+| 10% | 2,500 | 159 ms | 154 ms |
+| 33% | 1,000 | 74 ms | 71 ms |
+| 33% | 2,500 | 215 ms | 225 ms |
+
+Minimum of five runs each. At the largest share the rule can be given — one page
+in three, since at one in two the baseline absorbs both groups' markers and
+there are no outliers at all — 2,500 pages is about a million string compares
+inside a 215 ms rule. An earlier run of this pair reported 501 ms against 201 ms;
+that was a loaded machine, not the algorithm, and it is recorded here because a
+benchmark record that only keeps the flattering measurement is worth nothing.
+
+Three things had to be controlled before any of the numbers above meant
+anything, and each one produced a confident wrong answer first. They are worth
+knowing before re-running this or benchmarking any other rule.
+
+**Two rules reach the network and no obvious switch stops them.**
+`security/http-to-https` probes sample URLs over HTTP with staggered sleeps; at
+400 pages it was 508 ms of a 518 ms site phase, so the whole site phase was one
+rule waiting on sockets and the first version of this concluded from it that
+site rules were "dominated by a fixed cost". The soft-404 confirmation pass
+re-fetches candidates with a per-host sleep, and disabling it needs
+`config.integrity.soft404_confirm` — a root-level key of that name is silently
+ignored, and it defaults to enabled.
+
+**The rule profiler rounds every invocation to whole milliseconds.** Harmless
+for a site rule, which runs once per audit and takes tens of ms. Fatal when
+summed over page rules: 198 rules across 2,500 pages is 495,000 rounded samples,
+sub-millisecond work sums to zero, and a rule that crosses 1 ms on heavier pages
+jumps a whole unit. That artifact produced a published claim that v1's page
+rules were n^1.47 against streaming's n^1.01; unrounded timings of the same
+invocations put both near n^1.0. Page-rule cost here comes from phase spans,
+which are unrounded, and page-rule profiler lines are counted rather than summed.
+
+**A uniform fixture skips the branches that cost anything.** Three versions of
+this corpus did. The last one scored its off-theme pages at 0.258 against
+`template-discontinuity`'s 0.2 threshold, so the rule reported "all pages share
+the site's common template" and the quadratic scan never ran at all. One cause
+generalises past this rule: **the Jaccard of two empty sets is 1**, so a
+fingerprint term that neither the baseline nor the outlier declares pays full
+weight to SIMILARITY. The corpus now also carries pages nothing links to, hubs,
+4xx and noindex pages, off-page canonicals and schema on four templates, each
+gating a branch a uniform corpus skips.
+
+And a fourth, learned the hard way on the table above: **a loaded machine does
+not merely add noise to a cache-hostile scan, it systematically inflates it**, so
+minimum-of-N on a busy box is not a defence. Re-run the pair on a quiet machine
+before publishing a delta.
+
 ## Hosted runtime, in production
 
 Same 149-page rendered audit of the same site an hour apart, old image against
