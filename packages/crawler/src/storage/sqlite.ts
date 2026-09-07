@@ -1132,7 +1132,25 @@ export class SQLiteStorage implements CrawlStorage {
 
         if (sets.length > 0) {
           values.push(id);
-          const stmt = db.prepare(
+          // Cached, and safe to cache even though the SQL is built here. The
+          // cache is keyed by TEXT and `sets` is drawn from eight fixed
+          // optional columns in a fixed order, so there are at most 255 distinct
+          // texts however a caller mixes them.
+          //
+          // The hazard is not an unbounded cache. On Bun 1.3.14 the cache holds
+          // the first 20 texts PER DATABASE and NEVER EVICTS, so a statement
+          // that gets in stays in and one that arrives late never gets in at
+          // all: it recompiles on every call, forever and silently. Measured on
+          // a fresh database — 25 distinct texts, then three passes over the
+          // same 25, gave 15 compilations rather than 0, which is the five that
+          // never made it, three times each.
+          //
+          // So many shapes here would not evict anything already cached; they
+          // would fill the remaining slots and starve whatever is converted
+          // next. `Database.MAX_QUERY_CACHE_SIZE` raises the limit (30 caches
+          // all 25), but the default is what ships. The crawl loop writes only
+          // `stats`, once per page (#1911).
+          const stmt = db.query(
             `UPDATE crawls SET ${sets.join(", ")} WHERE id = ?`
           );
           stmt.run(...(values as (string | number | null)[]));
@@ -1247,7 +1265,10 @@ export class SQLiteStorage implements CrawlStorage {
           htmlToStore = null; // HTML is in content-store, not local DB
         }
 
-        const stmt = db.prepare(`
+        // Cached: once per crawled page (#1911). See the census in
+        // scripts/statement-compile-census.ts for why this one and not the
+        // other ninety.
+        const stmt = db.query(`
           INSERT OR REPLACE INTO pages (
             crawl_id, url, normalized_url, final_url, depth, parent_url,
             redirect_chain, status, content_type, size_bytes, load_time_ms, ttfb, download_time, fetched_at,
@@ -1438,7 +1459,10 @@ export class SQLiteStorage implements CrawlStorage {
         // shadowing the just-persisted source_hash. `rowid` tracks insert order
         // for this retained, append-like pages table (it isn't WITHOUT ROWID),
         // so DESC prefers the most recently written row on a tie.
-        const stmt = db.prepare(`
+        // Cached: once per URL on the incremental path, which the CLI takes by
+        // default (#1911). Same SQL text, so the plan and the tie-break above
+        // are unchanged; only the compilation is reused.
+        const stmt = db.query(`
           SELECT * FROM pages
           WHERE normalized_url = ?
           ORDER BY fetched_at DESC, rowid DESC
@@ -1535,7 +1559,8 @@ export class SQLiteStorage implements CrawlStorage {
     return Effect.try({
       try: () => {
         const db = this.getDb();
-        const stmt = db.prepare(`
+        // Cached: once per newly discovered URL (#1911).
+        const stmt = db.query(`
           INSERT OR REPLACE INTO frontier (
             crawl_id, normalized_url, raw_url, depth, parent_url,
             priority, status, source, enqueued_at, fetched_at, retry_count, reason
@@ -2000,7 +2025,9 @@ export class SQLiteStorage implements CrawlStorage {
     return Effect.try({
       try: () => {
         const db = this.getDb();
-        const stmt = db.prepare(
+        // Cached: once per newly discovered URL, on the enqueue path that has no
+        // link-count cache to read from (#1911).
+        const stmt = db.query(
           "SELECT COUNT(*) as count FROM link_appearances WHERE crawl_id = ? AND href = ?"
         );
         const row = stmt.get(crawlId, normalizedUrl) as { count: number };
@@ -2047,7 +2074,8 @@ export class SQLiteStorage implements CrawlStorage {
       try: () => {
         const db = this.getDb();
         // Get links that appear on this page (most recent crawl that has them)
-        const stmt = db.prepare(`
+        // Cached: once per REUSED page on a warm incremental crawl (#1911).
+        const stmt = db.query(`
           SELECT DISTINCT l.* FROM links l
           INNER JOIN link_appearances la ON l.crawl_id = la.crawl_id AND l.href = la.href
           WHERE la.page_url = ?
@@ -2203,7 +2231,8 @@ export class SQLiteStorage implements CrawlStorage {
       try: () => {
         const db = this.getDb();
         // Get images that appear on this page (most recent crawl that has them)
-        const stmt = db.prepare(`
+        // Cached: once per REUSED page on a warm incremental crawl (#1911).
+        const stmt = db.query(`
           SELECT DISTINCT i.* FROM images i
           INNER JOIN image_appearances ia ON i.crawl_id = ia.crawl_id AND i.src = ia.src
           WHERE ia.page_url = ?

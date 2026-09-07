@@ -148,6 +148,98 @@ not merely add noise to a cache-hostile scan, it systematically inflates it**, s
 minimum-of-N on a busy box is not a defence. Re-run the pair on a quiet machine
 before publishing a delta.
 
+## Storage statement compilation in the crawler
+
+`bun:sqlite` has two ways to get a statement and they are not interchangeable:
+`db.query(sql)` caches the compiled statement by SQL text, `db.prepare(sql)`
+compiles a new one every call. The crawler's storage layer used `prepare` in all
+116 places ([#1911](https://github.com/squirrelscan/repo/issues/1911)).
+[#247](https://github.com/squirrelscan/squirrelscan/pull/247) converted the
+per-link frontier check; a census of a real crawl then showed which of the
+remaining 95 still ran per page, and the answer was seven
+([#262](https://github.com/squirrelscan/squirrelscan/pull/262)).
+
+Compilations from `prepare` and `query`, 120-page crawl at 40 links/page:
+
+| | before | after |
+|---|---|---|
+| cold crawl, `incremental: true` (the CLI default) | 633 (5.3/page) | 38 (0.3/page) |
+| cold crawl, `incremental: false` | 513 (4.3/page) | 37 (0.3/page) |
+| **warm re-crawl of the same site** | **1,482 (12.3/page)** | **48 (0.4/page)** |
+
+The warm row is the one that matters, and it is the one a first census missed
+entirely. Five statements run per page on a cold crawl — `upsertPage`,
+`upsertFrontier`, `getIncomingLinkCount`, the crawl-stats `UPDATE` and
+`getCachedPage` — and two more run per REUSED page on a warm one,
+`getLinksByPage` and `getImagesByPage`. A re-audit is the common case and was
+paying 12.3 compilations per page.
+
+Compilation cost per statement, against the real schema, minimum of five
+interleaved rounds of 5,000. A `query` cache hit is 0.01 us in every row:
+
+| statement | `prepare` |
+|---|---|
+| `getCachedPage` | 10.17 us |
+| `getLinksByPage` | 9.71 us |
+| `upsertPage` | 9.30 us |
+| `getImagesByPage` | 9.16 us |
+| `upsertFrontier` | 4.91 us |
+| `getIncomingLinkCount` | 2.43 us |
+| `updateCrawl` (stats) | 1.78 us |
+
+47.5 us per page on a warm crawl, 0.5 s across a 10,000-page re-audit.
+
+**This is a count, not a time.** An interleaved A/B of the crawl at 400 pages
+gave minima of 1.1 s before and 0.9 s after, but the arithmetic accounts for
+about 19 ms of that 200 ms, so the wall-clock pair is noise and is not evidence.
+A count is immune to what else the machine is doing, which is why it is the
+headline and why the regression test asserts on compilation rather than a clock.
+Machine: 16 GB Apple Silicon laptop, load average 4 to 9 with other lanes
+running, which disqualifies the timing rows and does not touch the counts.
+
+### The statement cache has a ceiling, and it starves rather than evicts
+
+On Bun 1.3.14 it holds the first **20 texts per Database and never evicts**. A
+statement that gets in stays in; one that arrives late never gets in at all and
+recompiles on every call, forever and silently. Measured on a fresh database:
+25 distinct texts, then three passes over the same 25, gave 15 compilations
+rather than 0 — the five that never made it, three times each.
+`Database.MAX_QUERY_CACHE_SIZE` raises the limit (30 caches all 25), but the
+default is what ships. The crawler now uses 14 texts, so converting another six
+would fill it and starve whatever came next.
+
+### Counting compilations is version-dependent
+
+On 1.3.14 `db.query` routes a cache MISS through the public `prepare`, so a hook
+on `prepare` sees every compilation from both call styles — though not from
+`exec`/`run`, which the schema setup uses. On Bun 1.4.0 `query` compiles through
+an internal path that hook cannot see, and a census there would report zero and
+look like a pass. Three versions of this measurement were wrong: one missed
+query compilations, the next added distinct query texts to the prepare count and
+double-counted, and the third derived "served without compiling" as
+calls-minus-texts, which assumes every repeat hits and still reported 6,034 free
+calls with the cache forced to zero entries. The census now attributes each
+compilation to the call that caused it.
+
+### Byte-identity, and three digests that were not
+
+A serialised crawl at 120 and 250 pages produces the same digest before and
+after, over every deterministic page column, every frontier verdict and the
+crawls row, with the site crawled **twice** so the incremental path is exercised
+(the second crawl records 120 `hash_match` reuses).
+
+All three earlier versions of that digest were defeated in review. The first
+omitted `parsed_data` and passed with all 120 values nulled. The second omitted
+the stored `url` and passed with every one replaced by `CORRUPTED`. Both crawled
+once, which leaves the cache empty, so `getCachedPage` never hit and a version
+of it returning `null` unconditionally also passed.
+
+Two further things had to be fixed before any digest meant anything, and both
+first looked like the change breaking something: the crawl is non-deterministic
+at concurrency 8, because discovery order decides each URL's depth and parent,
+and `port: 0` puts a different ephemeral port in every stored URL, so identical
+code hashed differently three times running.
+
 ## Hosted runtime, in production
 
 Same 149-page rendered audit of the same site an hour apart, old image against
