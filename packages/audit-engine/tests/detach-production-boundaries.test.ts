@@ -18,6 +18,7 @@ import { Effect } from "effect";
 import type { Config } from "@squirrelscan/config";
 import { generateSiteModel, writeCrawlToStorage } from "@squirrelscan/synthetic-site";
 import { createRunner, type SiteData } from "@squirrelscan/rules";
+import { SchemaCollection } from "@squirrelscan/parser";
 
 import {
   buildSiteContext,
@@ -26,7 +27,7 @@ import {
   runStreamingRules,
   type PreFetchedAssets,
 } from "../src/adapter";
-import { detachCounts, detachFromPage, resetDetachCounts } from "../src/detach";
+import { detachCounts, detachFromPage, detachParsedPage, resetDetachCounts } from "../src/detach";
 
 function run<A>(eff: Effect.Effect<A, unknown, never>): Promise<A> {
   return Effect.runPromise(eff as Effect.Effect<A, never, never>);
@@ -116,14 +117,85 @@ describe("detach at the production boundaries", () => {
 
     const pageRules = detachCounts("page-rules");
     const signals = detachCounts("collected-signal");
+    const universe = detachCounts("parsed-universe");
 
-    // Removing either call site zeroes its counter — an equality-only test would
+    // Removing any call site zeroes its counter — an equality-only test would
     // not notice, because the findings are identical either way.
     expect(pageRules.detached).toBeGreaterThan(0);
     expect(signals.detached).toBeGreaterThan(0);
+    expect(universe.detached).toBeGreaterThan(0);
     // And no page silently kept its attachment.
     expect(pageRules.fallbacks).toBe(0);
     expect(signals.fallbacks).toBe(0);
+    expect(universe.fallbacks).toBe(0);
+
+    await run(storage.close());
+  }, 120_000);
+
+  test("a real parsed page detaches with its schemas still usable", async () => {
+    const { storage, crawlId } = await fixture(9, 5);
+    const pages = await run(storage.getPages(crawlId));
+    const ctx = await run(buildSiteContext(pages));
+
+    resetDetachCounts();
+    let checked = 0;
+
+    for (const { parsed } of ctx) {
+      if (!parsed) continue;
+      const copy = detachParsedPage(parsed);
+      checked++;
+
+      // The DOM is dropped, not cloned: cloning a live linkedom document throws,
+      // and a throw here would silently keep the whole page attached.
+      expect(copy.document).toBeNull();
+      expect(copy).not.toBe(parsed);
+
+      // `structuredClone` keeps SchemaCollection's data and loses its prototype.
+      // Without the rehydrate, site rules would read `undefined` off a plain
+      // object and quietly stop reporting.
+      expect(copy.schemas).toBeInstanceOf(SchemaCollection);
+      expect(copy.schemas.types).toEqual(parsed.schemas.types);
+      expect(copy.schemas.all).toEqual(parsed.schemas.all);
+      expect(copy.schemas.organization).toEqual(parsed.schemas.organization);
+      expect(copy.schemas.raw).toEqual(parsed.schemas.raw);
+
+      // Everything else survives byte for byte — this is what the golden gate
+      // depends on, asserted here per field rather than per report.
+      const { document: _d, schemas: _s, ...restCopy } = copy;
+      const { document: _d2, schemas: _s2, ...restSource } = parsed;
+      expect(restCopy).toEqual(restSource);
+
+      // DEEP, not shallow. A copy that only dropped `document` would satisfy
+      // every assertion above while every nested string still pinned the page,
+      // which is the whole point of the change.
+      expect(copy.schemas).not.toBe(parsed.schemas);
+      for (const key of ["meta", "content", "h1", "links", "images"] as const) {
+        const nested = parsed[key] as unknown;
+        if (nested && typeof nested === "object") {
+          expect(copy[key] as unknown).not.toBe(nested);
+        }
+      }
+    }
+
+    expect(checked).toBeGreaterThan(0);
+    expect(detachCounts("parsed-universe")).toEqual({ detached: checked, fallbacks: 0 });
+
+    // The path this change is FOR: a crawl with no stored parsedData, where the
+    // parse ran against a live DOM and every scalar is a slice of the page.
+    resetDetachCounts();
+    const pagesNoParse = pages.map((p) => ({ ...p, parsedData: null }));
+    const ctxNoParse = await run(buildSiteContext(pagesNoParse));
+    let reparsed = 0;
+    for (const { parsed } of ctxNoParse) {
+      if (!parsed) continue;
+      const copy = detachParsedPage(parsed);
+      expect(copy.document).toBeNull();
+      expect(copy.schemas).toBeInstanceOf(SchemaCollection);
+      expect(copy.links).toEqual(parsed.links);
+      reparsed++;
+    }
+    expect(reparsed).toBeGreaterThan(0);
+    expect(detachCounts("parsed-universe")).toEqual({ detached: reparsed, fallbacks: 0 });
 
     await run(storage.close());
   }, 120_000);
