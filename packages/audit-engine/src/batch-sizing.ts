@@ -27,11 +27,83 @@ import type { SQLiteStorage } from "@squirrelscan/crawler";
 /**
  * Default raw-html bytes held per batch. 48 MB parses to roughly 600 MB on the
  * heaviest pages measured, which fits a standard-3 container (8 GiB) alongside
- * the crawl's own high-water and the report tail with room to spare.
+ * the crawl's own high-water and the report tail with room to spare. That
+ * sizing predates the sweep below and is not established by it.
+ *
+ * WHAT WAS MEASURED (scripts/batch-budget-sweep.ts, 150 real 959 KB pages, peak
+ * read from the OS rather than an in-process sampler, batch resolved from the
+ * budget by this module, three runs per budget, one machine, one load):
+ *
+ *   budget    batch    peak RSS over 3 runs
+ *     6 MB        6      480, 486, 516 MB
+ *    12 MB       12      357, 401, 417 MB
+ *    24 MB       25      492, 517, 592 MB
+ *    48 MB       51      579, 634, 635 MB
+ *    96 MB      102      682, 705, 706 MB
+ *
+ * OBSERVATIONS, and deliberately not more than these.
+ *
+ * No budget tried produced a peak under 357 MB, and an 8.5-fold larger batch
+ * (12 to 102 pages) produced a peak 1.9 times larger on the minima and 2.0
+ * times larger taking the extremes. What that means for the invariant part
+ * of the peak is not established here: five budgets on one fixture cannot
+ * identify a component or say what it is made of. Do not read a formula off
+ * these points either — a straight line through the ends misses the middle of
+ * its own table by 100 MB, and the spread within a single budget runs from 24 to
+ * 100 MB.
+ *
+ * All three runs at a 6 MB budget peaked above all three at 12 MB. Two things
+ * differ between them at once — the batch holds less, and the same crawl takes
+ * about twice as many read-parse-collect cycles — so this is a reason not to
+ * assume the direction, not a threshold and not a cause. If a container is
+ * tight, measure the budget you intend to set.
+ *
+ * The incremental RSS one batch costs is much smaller after a run than before
+ * it: 51 pages cost 312 MB of fresh RSS from a standing start and 41 MB again
+ * afterwards; 12 pages cost 89 MB and then 0. The two arms are not controlled
+ * against each other — after the run, SQLite's cache, the OS page cache, the
+ * parser and the JIT are all warm — so each of those is an alternative
+ * explanation, and this does not measure how much of the residency is reusable.
+ *
+ * Bun honours mimalloc's environment options — `MIMALLOC_VERBOSE=1` prints its
+ * option dump — so `MIMALLOC_PURGE_DELAY=0`, which asks it to decommit freed
+ * pages immediately, is a setting that reaches the allocator. One run per cell
+ * (`--mimalloc`):
+ *
+ *   budget      default    purge delay 0
+ *     6 MB       303 MB           312 MB
+ *    12 MB       370 MB           362 MB
+ *    24 MB       541 MB           582 MB
+ *    48 MB       552 MB           878 MB
+ *    96 MB      1070 MB           719 MB
+ *
+ * The differences are +9, -8, +41, +326 and -351 MB. They go both ways and the
+ * two largest exceed the whole within-budget spread above, but one run per cell
+ * cannot separate an allocator effect from run variability in either direction.
+ * This is a reason to measure the setting before relying on it, not evidence
+ * that it does nothing.
+ *
+ * Every peak in the table is a whole child process's high-water — universe, site
+ * fetch, page loop, site query, site rules, assembly — because that is what a
+ * container is charged for. The budget sizes more than one of those phases, so
+ * none of the table attributes a peak to the page loop alone. And the values are
+ * one machine under one load: re-running two of these budgets while the machine
+ * was busy gave 515 and 845 MB where the table says 357 and 579. The shape is
+ * the finding; the numbers are not a spec, and a container is not safe because
+ * it exceeds one of them.
  */
 export const STREAM_BATCH_BYTES = 48 * 1024 * 1024;
 
-/** Floor: below this the per-batch storage round-trips start to dominate. */
+/**
+ * Floor: below this the per-batch storage round-trips start to dominate.
+ *
+ * Left where it is deliberately. The sweep above found a 6-page batch peaking
+ * higher than a 12-page one, but raising this clamp would bind at the NEW
+ * threshold rather than fixing that case, and it only engages at all when the
+ * budget divided by the average page falls under it — at the default budget,
+ * pages of nearly 10 MB. Moving it is a change to the budget's meaning at every
+ * size, on the evidence of two adjacent points.
+ */
 export const STREAM_BATCH_MIN_PAGES = 5;
 
 /** Ceiling: a light-page site must not talk itself into a whole-crawl batch. */
