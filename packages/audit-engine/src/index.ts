@@ -17,6 +17,13 @@ export {
   isRenderedFetch,
   renderedPageUrlsFrom,
   setAdapterLogger,
+  // Pre-rules collection seams (#1860) — the DOM-needing halves of the asset and
+  // external-link phases, split so they can be fed one page batch at a time.
+  absorbExternalLinkOccurrences,
+  checkCollectedExternalLinks,
+  createSiteAssetCollector,
+  fetchAssetsFromOccurrences,
+  V1_REPORT_PAGE_BATCH,
 } from "./adapter";
 export type {
   SiteContextPage,
@@ -25,6 +32,9 @@ export type {
   PreFetchedAssets,
   ResourceCheckOverrides,
   ExternalLinkCheckProgress,
+  ExternalLinkOccurrences,
+  SiteAssetOccurrences,
+  BuildV1ReportOptions,
   FullAuditReport,
   PageAudit,
   AuditSummary,
@@ -105,6 +115,7 @@ export * from "./runner";
 export {
   localIntelContext,
   buildFullIntelContext,
+  buildFullIntelContextFromUrls,
   mapIntelConfig,
   collectIntelUrls,
 } from "./intel";
@@ -178,3 +189,8 @@ export { isHtmlContentType } from "./adapter";
 // Streaming rules engine (#1021, PR-E) — batched page-rule pass with DOM-drop.
 export { streamPageRules, STREAM_PAGE_BATCH } from "./streaming";
 export type { PageSignalCollector, StreamPageRulesHooks, StreamPageRulesResult } from "./streaming";
+
+// Streamed pre-rules phase (#1860) — one batched walk that feeds the asset,
+// external-link, tech-detect, intel and cloud-prefetch collectors together.
+export { runStreamingPreRules, PRE_RULES_PAGE_BATCH } from "./streaming-pre-rules";
+export type { StreamPreRulesOptions, StreamPreRulesResult } from "./streaming-pre-rules";
