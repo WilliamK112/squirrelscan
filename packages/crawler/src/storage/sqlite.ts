@@ -3093,26 +3093,7 @@ export class SQLiteStorage implements CrawlStorage {
         const result = new Map<string, CheckResult[]>();
         for (const row of rows) {
           const pageUrl = row.page_url as string;
-          const check: CheckResult = {
-            name: row.check_name as string,
-            status: row.status as CheckResult["status"],
-            message: row.message as string,
-            value:
-              row.value !== null ? (row.value as string | number) : undefined,
-            expected:
-              row.expected !== null
-                ? (row.expected as string | number)
-                : undefined,
-            pageUrl: pageUrl || undefined,
-            items: row.items ? JSON.parse(row.items as string) : undefined,
-            details: row.details
-              ? JSON.parse(row.details as string)
-              : undefined,
-            pages: row.pages ? JSON.parse(row.pages as string) : undefined,
-            skipReason: row.skip_reason
-              ? (row.skip_reason as string)
-              : undefined,
-          };
+          const check = this.rowToCheckResult(row);
           const existing = result.get(pageUrl) ?? [];
           existing.push(check);
           result.set(pageUrl, existing);
@@ -3141,27 +3122,7 @@ export class SQLiteStorage implements CrawlStorage {
         const result = new Map<string, CheckResult[]>();
         for (const row of rows) {
           const ruleId = row.rule_id as string;
-          const pageUrl = row.page_url as string;
-          const check: CheckResult = {
-            name: row.check_name as string,
-            status: row.status as CheckResult["status"],
-            message: row.message as string,
-            value:
-              row.value !== null ? (row.value as string | number) : undefined,
-            expected:
-              row.expected !== null
-                ? (row.expected as string | number)
-                : undefined,
-            pageUrl: pageUrl || undefined,
-            items: row.items ? JSON.parse(row.items as string) : undefined,
-            details: row.details
-              ? JSON.parse(row.details as string)
-              : undefined,
-            pages: row.pages ? JSON.parse(row.pages as string) : undefined,
-            skipReason: row.skip_reason
-              ? (row.skip_reason as string)
-              : undefined,
-          };
+          const check = this.rowToCheckResult(row);
           const existing = result.get(ruleId) ?? [];
           existing.push(check);
           result.set(ruleId, existing);
@@ -3170,6 +3131,99 @@ export class SQLiteStorage implements CrawlStorage {
       },
       catch: (e) => StorageError.read(e),
     });
+  }
+
+  /**
+   * Both groupings of a crawl's rule results, from ONE materialization (#1920).
+   *
+   * `getRuleResultsByPage` and `getRuleResultsByRuleId` differ only in their
+   * `ORDER BY`; every other line, including the CheckResult built per row, is
+   * the same. The report path calls both, so a crawl's checks were read twice
+   * and materialized twice: at 1,000 pages that is 203,687 rows, 204 per page,
+   * and about 500 bytes of object per 55 bytes of data. Measured in isolation,
+   * the two reads grow RSS by 441 MB against 249 MB for this one.
+   *
+   * ORDER COMES FROM SQLITE, not from a rule about ties. An earlier version of
+   * this read once `ORDER BY id` and grouped, having measured that both original
+   * queries returned their ties in `id` order. That was incidental to today's
+   * indexes: with an index on `(crawl_id, rule_id, page_url)` the per-rule query
+   * returns its ties in page_url order instead, and the emitted issue order
+   * changes with it. SQLite leaves tied `ORDER BY` rows unordered by contract.
+   *
+   * So the heavy work happens once and the ORDER is asked for twice, with the
+   * same `ORDER BY` each original used, reading only `id` and the grouping key.
+   * Those two extra queries carry integers and one short string per row instead
+   * of a parsed CheckResult, and the result is byte-identical to the readers
+   * this replaces under any index or query plan.
+   */
+  getRuleResultsGrouped(crawlId: string): Effect.Effect<
+    {
+      byPage: Map<string, CheckResult[]>;
+      byRuleId: Map<string, CheckResult[]>;
+    },
+    StorageError,
+    never
+  > {
+    return Effect.try({
+      try: () => {
+        const db = this.getDb();
+
+        // The one materialization. Keyed by row id so the ordering passes below
+        // can address a check without rebuilding it.
+        const byId = new Map<number, CheckResult>();
+        for (const row of db
+          .prepare("SELECT * FROM rule_results WHERE crawl_id = ?")
+          .all(crawlId) as Record<string, unknown>[]) {
+          byId.set(row.id as number, this.rowToCheckResult(row));
+        }
+
+        // `ORDER BY <column>` verbatim from the reader being replaced, so the
+        // sequence is whatever SQLite would have produced there.
+        const groupBy = (
+          column: "page_url" | "rule_id"
+        ): Map<string, CheckResult[]> => {
+          const ordered = db
+            .prepare(
+              `SELECT id, ${column} AS k FROM rule_results WHERE crawl_id = ? ORDER BY ${column}`
+            )
+            .all(crawlId) as Array<{ id: number; k: string }>;
+          const out = new Map<string, CheckResult[]>();
+          for (const { id, k } of ordered) {
+            const check = byId.get(id);
+            // Unreachable: both statements read the same rows in one connection.
+            // Skipping rather than asserting keeps a torn read from throwing in
+            // the report path, where the alternative is no report at all.
+            if (!check) continue;
+            const list = out.get(k);
+            if (list) list.push(check);
+            else out.set(k, [check]);
+          }
+          return out;
+        };
+
+        return { byPage: groupBy("page_url"), byRuleId: groupBy("rule_id") };
+      },
+      catch: (e) => StorageError.read(e),
+    });
+  }
+
+  /** One `rule_results` row as a CheckResult. The single definition the three
+   * readers share, so a column added to one cannot be forgotten in the others. */
+  private rowToCheckResult(row: Record<string, unknown>): CheckResult {
+    const pageUrl = row.page_url as string;
+    return {
+      name: row.check_name as string,
+      status: row.status as CheckResult["status"],
+      message: row.message as string,
+      value: row.value !== null ? (row.value as string | number) : undefined,
+      expected:
+        row.expected !== null ? (row.expected as string | number) : undefined,
+      pageUrl: pageUrl || undefined,
+      items: row.items ? JSON.parse(row.items as string) : undefined,
+      details: row.details ? JSON.parse(row.details as string) : undefined,
+      pages: row.pages ? JSON.parse(row.pages as string) : undefined,
+      skipReason: row.skip_reason ? (row.skip_reason as string) : undefined,
+    };
   }
 
   getCrawlByUrl(
