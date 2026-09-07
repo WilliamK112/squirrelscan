@@ -987,6 +987,19 @@ export interface PaginationOptions {
   offset?: number;
 }
 
+/**
+ * The two columns the audit's incoming-link scan reads (#1860).
+ *
+ * `getPages` is `SELECT *`, so using it for a link-graph walk materializes
+ * every page's HTML — and pulls it back out of the content store when it was
+ * offloaded — even though the walk reads only these two fields and never looks
+ * at the HTML at all.
+ */
+export interface PageLinkRow {
+  normalizedUrl: string;
+  parsedData: string | null;
+}
+
 export interface StorageOptions {
   path?: string;
   projectName?: string;
