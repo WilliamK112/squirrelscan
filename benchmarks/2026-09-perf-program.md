@@ -239,6 +239,34 @@ first looked like the change breaking something: the crawl is non-deterministic
 at concurrency 8, because discovery order decides each URL's depth and parent,
 and `port: 0` puts a different ephemeral port in every stored URL, so identical
 code hashed differently three times running.
+## Not a performance change: the page cap said nothing
+
+Recorded here because #1028 needs the page count to be expressible from the CLI
+at all, and it was not. `squirrel audit --max-pages 10000` crawled 5,000 and
+reported `maxPages: 5000`, which is byte-identical to what a 5,000-page site
+reports ([#1909](https://github.com/squirrelscan/repo/issues/1909),
+[#264](https://github.com/squirrelscan/squirrelscan/pull/264)).
+
+No timings: there is no intended crawl-performance change here and no
+before/after to measure. What it changes is whether the number a
+measurement was taken at is knowable afterwards, which is what every other row
+in this file depends on.
+
+`MAX_PAGES_CAP` was applied with a bare `Math.min` in five places — the `audit`
+and `crawl` commands, the audit controller, and twice in the crawl controller —
+none of which said anything. The existing notice fires when a crawl REACHES the cap, a different
+event: a 10,000-page request against a 4,000-page site was clamped and never
+mentioned. Now one helper resolves the request, both commands print the clamp, and the
+report carries `meta.maxPages` alongside `meta.requestedMaxPages`, the latter
+present only when a clamp happened so its absence is the normal case. The LLM
+render carries the same pair, which is the whole response for an MCP caller.
+
+Worth recording because it nearly went the other way: a first version of the
+helper passed non-finite requests through untouched, reasoning that the commands
+reject bad input themselves. `[crawler] max_pages = inf` passes the config
+schema and never reaches that check, so `Infinity` went straight to the crawler
+and the hard cap stopped being hard. A safety bound does not get exceptions for
+inputs that look invalid; `effective` is `Math.min` for every input, as it was.
 
 ## Hosted runtime, in production
 

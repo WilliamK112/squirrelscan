@@ -24,6 +24,7 @@ import {
 } from "@/controllers/types";
 import { createCrawler } from "@/crawler/core";
 import { createStorage, domainToProjectName } from "@/crawler/storage";
+import { resolvePageLimit } from "@/lib/page-limit";
 import { initRequestTool } from "@/tools/request";
 import { configureLogger, logger } from "@/utils/logger";
 import { checkReachability } from "@/utils/reachability";
@@ -232,10 +233,9 @@ export async function runCrawl(
       const crawler = await Effect.runPromise(
         createCrawler({
           config: {
-            maxPages: Math.min(
-              options.maxPages ?? config.crawler.max_pages,
-              MAX_PAGES_CAP
-            ),
+            maxPages: resolvePageLimit(
+              options.maxPages ?? config.crawler.max_pages
+            ).effective,
             concurrency: crawlConcurrency.concurrency,
             perHostConcurrency: crawlConcurrency.perHostConcurrency,
             delayMs: config.crawler.delay_ms,
@@ -283,10 +283,8 @@ export async function runCrawl(
       );
 
       const crawlerConfig = {
-        maxPages: Math.min(
-          options.maxPages ?? config.crawler.max_pages,
-          MAX_PAGES_CAP
-        ),
+        maxPages: resolvePageLimit(options.maxPages ?? config.crawler.max_pages)
+          .effective,
         concurrency: crawlConcurrency.concurrency,
         perHostConcurrency: crawlConcurrency.perHostConcurrency,
         delayMs: config.crawler.delay_ms,

@@ -62,7 +62,6 @@ import {
   CRAWL_PHASE_MIN_TIMEOUT_MS,
   CRAWL_PHASE_PER_PAGE_BUDGET_MS,
   CRAWL_PHASE_SETUP_SLACK_MS,
-  MAX_PAGES_CAP,
 } from "@/constants";
 import {
   type Result,
@@ -76,6 +75,7 @@ import { resolveSeedRedirect } from "@/crawler/frontier";
 import { createStorage, domainToProjectName } from "@/crawler/storage";
 import { getGlobalLinkCache } from "@/crawler/storage/link-cache";
 import { preflightBalanceOf } from "@/lib/balance";
+import { resolvePageLimit } from "@/lib/page-limit";
 import { reconstructReport } from "@/reports/reconstruct";
 import { detectRunner } from "@/self/install-meta";
 import { createCloudClientFromSettings } from "@/tools/cloud";
@@ -1610,9 +1610,26 @@ export async function runAudit(
       // score with its basis. REPORT-ONLY.
       {
         const scopeMaxPages = mergedConfig.crawler.max_pages;
+        // `requestedMaxPages` from the command layer when it clamped; otherwise
+        // recompute here, since a caller reaching the controller directly never
+        // passed through that layer (#1909).
+        const requested =
+          options.requestedMaxPages ??
+          options.maxPages ??
+          config.crawler.max_pages;
+        const scopeLimit = resolvePageLimit(requested);
+        // FINITE only. `[crawler] max_pages = inf` is a real clamp and the
+        // command says so on stderr, but `JSON.stringify(Infinity)` is `null`,
+        // and a null here would read as "no request recorded" rather than as
+        // "asked for everything" — worse than leaving it out.
+        const recordRequested =
+          scopeLimit.clamped && Number.isFinite(scopeLimit.requested);
         report.scanScope = {
           origin: detectRunner().ci ? "ci" : "cli",
           maxPages: scopeMaxPages,
+          ...(recordRequested
+            ? { requestedMaxPages: scopeLimit.requested }
+            : {}),
           pagesCrawled: report.pages.length,
           capped: report.pages.length >= scopeMaxPages,
         };
@@ -1884,10 +1901,12 @@ export function mergeOptionsToConfig(
     }),
     crawler: {
       ...config.crawler,
-      max_pages: Math.min(
-        options.maxPages ?? config.crawler.max_pages,
-        MAX_PAGES_CAP
-      ),
+      // Same clamp as the commands, through the same helper so the five cannot
+      // drift (#1909). Callers that reach the controller directly — the MCP
+      // audit tool, programmatic use — get the cap applied here; they see it in
+      // the report's `scanScope` rather than on stderr.
+      max_pages: resolvePageLimit(options.maxPages ?? config.crawler.max_pages)
+        .effective,
       ...(typeof options.maxDepth === "number"
         ? { max_depth: Math.max(1, Math.floor(options.maxDepth)) }
         : {}),
