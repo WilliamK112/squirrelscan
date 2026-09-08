@@ -656,6 +656,131 @@ with `apps/cli/scripts/template-cluster-census.ts` and
 `apps/cli/scripts/template-rule-invariance.ts` against a finished `project.db`;
 they need no network and do not write to the crawl they read.
 
+## The rules phase on a script-heavy page
+
+A 500-page cloud audit of drscholls.com failed its 2400 s run budget after the
+memory ceiling had been raised, because the rules phase cost about 2 s per page
+on the container. Every page there is ~1 MB with ~800 KB of inline script, and
+that shape is not what the mixed estate above measures — it dilutes it to a
+tenth. `harness/script-heavy-site.ts` serves N byte-unique copies of one real
+saved page instead ([squirrelscan/repo#1864](https://github.com/squirrelscan/repo/issues/1864)).
+
+Fixture: a real 1.13 MB product page, 59 inline scripts, 791 KB of inline
+JavaScript, 40 internal links woven into each copy, 150 pages. Command
+`squirrel audit --coverage full --max-pages 150 --http --offline --refresh
+--trace` with `SQUIRREL_RULE_PROFILE=1`, a fresh project and a per-run title
+salt so the global content store cannot serve one arm's pages to the other.
+Three interleaved rounds per arm, medians, load average 3.2 to 5.0 throughout.
+
+| | before | after |
+|---|---|---|
+| **whole rules phase** | **274.1 ms/page** | **164.5 ms/page** |
+| `security/leaked-secrets` | 64.5 | 29.3 |
+| `a11y/skip-link` | 38.5 | 2.4 |
+| `perf/js-libraries` | 31.2 | 7.2 |
+| `perf/unminified-js` | 15.6 | 4.1 |
+| `legal/cookie-consent` | 8.2 | 8.0 |
+| `social/share-buttons` | 6.4 | 6.4 |
+| audit wall time | 56 s | 42 s |
+
+The four changed rules go from 149.9 to 43.0 ms/page. The last two rows are the
+control: nothing else in the phase moves, and the run-to-run spread is 265.5 to
+281.6 ms/page before and 164.4 to 173.9 after, so the 110 ms is not noise.
+
+Findings are byte-identical over the same 150 pages, `perf/ttfb` excepted — it
+grades the test server's response time and disagrees with itself between any two
+runs on a loaded box.
+
+Three of the four were ordinary waste. `a11y/skip-link` built `body.innerHTML`
+inside its loop over headings, serialising the whole megabyte once per heading,
+and then searched all of it for a heading that only counts inside the first 2000
+characters. `perf/unminified-js` counted with `String.match` and a `/g` pattern
+five times per script, building an array of every match to read its length.
+`shared/comment-scan` compared single-character STRINGS on its per-character
+path; comparing code points is about thirteen times faster (10.3 ms against
+0.8 ms over one 390 KB bundle).
+
+The fourth is the interesting one. `security/leaked-secrets` runs 70 patterns and
+`perf/js-libraries` about 130 over the same text, and a pass over 1 MB costs the
+same whether it finds anything or not — so the cost is the pass COUNT. One pass
+that records which 4-grams the text contains lets a pattern be skipped when a
+literal every match of it must contain is provably absent. Per page, over the
+58 bodies of text (the serialised document and 57 inline scripts, 1.9 MB in all):
+
+| | ms |
+|---|---|
+| build the 4-gram index over every body | 5.4 |
+| all 70 secret patterns, no prefilter | 42.4 |
+| only the patterns that survive the index | 14.6 |
+| `toLowerCase` every body (now built only on demand) | 3.8 |
+
+48% of secret-pattern invocations are skipped and 99% of the context-keyword
+scans. The residual is mostly irreducible: **18 of the 70 patterns prove no
+literal at all** — `[0-9]{8,10}:[a-zA-Z0-9_-]{35}` has nothing to prove — and
+those 18 are the top of the remaining cost, led by the Telegram bot token at
+2.0 ms per page.
+
+Soundness bugs kept turning up in the prefilter before it shipped, all of them
+silent false negatives, which in this rule means a deleted security finding.
+Reading the diff found these three:
+
+- The rolling hash was masked with the TABLE's width rather than the window's,
+  so a table wider than 20 bits kept the low bit of the character BEFORE the
+  4-character window. Present needles were denied whenever their predecessor was
+  odd — 8 of 16 on a 40 KB text. The table only reaches that width past about
+  32 KB, which every fixture in the suite sat below.
+- An element that can repeat was expanded as though it occurred at most once,
+  gluing a run together across it: `abcdz{0,3}efgh` proved `abcdefgh` or
+  `abcdzefgh` and denied `abcdzzefgh`, which it matches.
+- The index folds ASCII case, which over-approximates the text but not
+  `text.toLowerCase()`, where the context keywords are looked up. Exactly two
+  characters in Unicode lowercase into ASCII the text does not itself have:
+  U+0130 and U+212A KELVIN SIGN. `postmar<U+212A>_server_token` lowercases to
+  `postmark_server_token`, and the index rightly said `postmark` was absent.
+
+Three more were escapes read as shorter than they are, each leaving its own tail
+behind as literal text no match contains: `\12` (a backreference to group 12,
+read as `\1` then `2`), `\k<x>`, and `\u{41}`, which is a code point only under
+the `u` flag and otherwise the letter `u` repeated 41 times.
+
+An adversarial review pass found five more of the same kind, all counterexamples
+rather than reproductions from the shipped tables. `.` was in the character class
+the group shortcut accepts as literal, so `/(abcd.efgh)/` proved a wildcard as
+itself. An atom that proves nothing was dropping its quantifier, so
+`/abcd\d{1000}efgh/` handed `1000` to the scanner as four literal characters.
+`[]` is an EMPTY class in JavaScript, not a literal bracket, so reading past its
+`]` in `/abcd[]|efgh/` hid the `|` and left one branch where there are two. The
+`\p{` and `\u{` reads searched forward for a `}` that in legacy mode belongs to
+a character class. And under the `u` flag the `i` flag folds beyond ASCII, so
+`/secret/iu` matches `ſecret`, which does not contain `secret` — Unicode-mode
+patterns are now declined whole.
+
+A second review pass found two more of the same family, both legacy escapes
+whose length is not knowable from the source: `\c` is a control escape only
+before an ASCII letter and otherwise the two characters `\` and `c`, and
+`\k<name>` is a named backreference only when the pattern declares a named
+group. Guessing either length walked the scan into a character class.
+
+The pattern in every one is the same: **the extractor read the regex as something
+the engine does not**, and the specific move that caused half of them was
+searching forward for a delimiter — `}`, `>`, `]` — which lands inside whatever
+structure happens to contain one. The defence that works is a counterexample
+corpus of (pattern, subject-it-really-matches) pairs, because that comparison
+does not depend on anyone's reading being right.
+
+The generative soundness test that was supposed to catch several of them could
+not run at all: its own string generator looped forever on `\d`, `\w` and `\s`,
+so three of its hand-written expectations described an implementation that no
+longer existed. Its random number generator also multiplied past 2^53 and lost
+its low bits, so 60 of 60 Redis samples took the same alternative and no Generic
+Secret Assignment sample ever chose `password` — a generator that walks one
+branch cannot notice an extractor that proves one branch. **A skipped, hanging or
+degenerate test is read as evidence.** Every regression test here was
+mutation-checked by restoring the bug it claims to catch, and two of them did not
+bite until the fixture varied the character immediately before the literal — `"`
+is even and `'` is odd, and a corpus that quotes everything the same way is blind
+to the whole class.
+
 ## Still open
 
 - Site rules are quadratic in page count (4 s at 400 pages, 99 s at 2,500,
@@ -665,6 +790,14 @@ they need no network and do not write to the crawl they read.
   rather than twice is done (above); dropping the passing rows needs a decision
   about the publish payload first.
 - `--max-pages` above 5,000 is silently clamped: squirrelscan/repo#1909.
+- `legal/cookie-consent` (8.2 ms/page) and `social/share-buttons` (6.4) are now
+  the top of the script-heavy rules phase and were left alone. The first is
+  seven full-document `querySelectorAll` passes with substring attribute
+  selectors, which is a linkedom cost rather than a regex one. The second
+  lowercases the whole page for four `/i` patterns that do not need it — and
+  removing that is NOT a no-op, because `String.toLowerCase` and the `i` flag
+  disagree: `"K".toLowerCase()` is `"k"` while `/k/i` does not match
+  `K`, and the same for `İ` and `i`. It needs a decision, not a patch.
 - The finalize rewrites every carried finding to stamp `provenance`, even when it
   already reads "carried" from an earlier run. A no-op write is most of the write
   traffic on a site that carries the same backlog audit after audit.
