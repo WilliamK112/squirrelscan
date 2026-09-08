@@ -60,7 +60,7 @@ export interface ContentStoreAdapter {
 // Schema version - increment when schema changes.
 // Exported so migration tests can assert "this DB reached the CURRENT version" rather than pinning a
 // literal, which turned every schema bump into two unrelated test failures.
-export const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 25;
 
 // Migrations to run when upgrading from older versions
 const MIGRATIONS: Record<number, string[]> = {
@@ -335,6 +335,15 @@ const MIGRATIONS: Record<number, string[]> = {
     `ALTER TABLE links ADD COLUMN rate_limited INTEGER`,
     `ALTER TABLE sitemap_url_statuses ADD COLUMN rate_limited INTEGER`,
   ],
+  // Version 25: when an audit's data was reclaimed (squirrelscan/repo#1912).
+  // `self disk --prune` deletes a crawl's derived rows and leaves the `crawls`
+  // row, so without this the audit still reads as `completed` and the report
+  // path rebuilds a CONFIDENT EMPTY report from whatever pages survive — worse
+  // than the disk it saved. Stamped by `retireCrawls`; NULL for every audit that
+  // has not been reclaimed, which is all of them until someone prunes. ADDITIVE;
+  // ALTER is idempotent (the runner swallows "duplicate column name"). Local
+  // sqlite only — NOT a prod migration.
+  25: [`ALTER TABLE crawls ADD COLUMN retired_at INTEGER`],
 };
 
 // Nullable columns added to `pages` via ALTER migrations over time, with the
@@ -395,6 +404,18 @@ const SITEMAP_URL_STATUSES_ALTER_COLUMNS: ReadonlyArray<{ name: string; type: st
   { name: "rate_limited", type: "INTEGER" },
 ];
 
+// Same guard for `crawls`. Migration 25 added `retired_at`; a DB stamped past 25
+// by a build that numbered its own migration 25 would skip it forever. The
+// failure is quieter than the four tables before it and worse for that: reads
+// are `SELECT *` mapped by key, so a missing column does not throw, it yields
+// `undefined` — every retired audit silently reads as NOT retired and renders
+// the empty report this column exists to prevent. The prune's own UPDATE is the
+// only part that fails loudly. So the column goes on the list at the same time
+// it goes in the migration, like the five before it.
+const CRAWLS_ALTER_COLUMNS: ReadonlyArray<{ name: string; type: string }> = [
+  { name: "retired_at", type: "INTEGER" },
+];
+
 const SCHEMA = `
 -- Crawl sessions
 CREATE TABLE IF NOT EXISTS crawls (
@@ -404,7 +425,11 @@ CREATE TABLE IF NOT EXISTS crawls (
   completed_at INTEGER,
   status TEXT NOT NULL,
   config TEXT NOT NULL,
-  stats TEXT NOT NULL
+  stats TEXT NOT NULL,
+  -- When "self disk --prune" reclaimed this audit's data (#1912). NULL until
+  -- something retires it, which is every audit unless the user asks. No
+  -- backticks in here: SCHEMA is a template literal and they would close it.
+  retired_at INTEGER
 );
 
 -- Pages
@@ -985,6 +1010,7 @@ export class SQLiteStorage implements CrawlStorage {
     this.reconcileColumns("robots_txt", ROBOTS_TXT_ALTER_COLUMNS);
     this.reconcileColumns("links", LINKS_ALTER_COLUMNS);
     this.reconcileColumns("sitemap_url_statuses", SITEMAP_URL_STATUSES_ALTER_COLUMNS);
+    this.reconcileColumns("crawls", CRAWLS_ALTER_COLUMNS);
   }
 
   /**
@@ -999,7 +1025,13 @@ export class SQLiteStorage implements CrawlStorage {
   }
 
   private reconcileColumns(
-    table: "pages" | "sitemaps" | "robots_txt" | "links" | "sitemap_url_statuses",
+    table:
+      | "pages"
+      | "sitemaps"
+      | "robots_txt"
+      | "links"
+      | "sitemap_url_statuses"
+      | "crawls",
     columns: ReadonlyArray<{ name: string; type: string }>
   ): void {
     const db = this.getDb();
@@ -1228,6 +1260,7 @@ export class SQLiteStorage implements CrawlStorage {
       startedAt: row.started_at as number,
       completedAt: (row.completed_at as number | null) ?? undefined,
       status: row.status as CrawlMetadata["status"],
+      retiredAt: (row.retired_at as number | null) ?? undefined,
       config: this.safeJsonParse(
         row.config as string,
         {} as CrawlMetadata["config"]
@@ -3253,6 +3286,203 @@ export class SQLiteStorage implements CrawlStorage {
       pages: row.pages ? JSON.parse(row.pages as string) : undefined,
       skipReason: row.skip_reason ? (row.skip_reason as string) : undefined,
     };
+  }
+
+  /**
+   * Tables holding a crawl's DERIVED output — everything that can be recomputed
+   * by auditing again, and nothing another crawl reads (#1912).
+   *
+   * Deliberately excluded, and why:
+   *  - `pages`, handled separately below: the newest row per url is the
+   *    conditional-GET cache the next crawl reads.
+   *  - `resource_sizes`: `getCachedResources` takes the most recent per
+   *    (type, url) across OTHER crawls, so a retired crawl's rows may still be
+   *    the freshest sub-resource record anyone has (#107). Small, and load-bearing.
+   *  - `published_reports`: the record that this crawl was published. Not
+   *    recomputable, and tiny.
+   *  - `links`, `images` and their `_appearances`: read ACROSS crawls.
+   *    `getLinksByPage` and `getImagesByPage` take the most recent crawl that
+   *    has them, with no crawl_id filter, and `reuseCachedPage` copies the
+   *    result into the next crawl when it serves a page from cache. Retiring
+   *    them would leave a reused page with no links or images in the NEXT
+   *    audit's report, which is a quiet wrong answer rather than a missing one.
+   *  - `crawls` itself: the row stays so `report --list` can still show the
+   *    audit and say it is no longer renderable, rather than the history
+   *    silently shrinking.
+   */
+  private static readonly RETIREABLE_TABLES = [
+    "rule_results",
+    "sitemap_urls",
+    "sitemaps",
+    "sitemap_url_statuses",
+    "page_features",
+    "robots_txt",
+    "llms_txt",
+    "markdown_response",
+    "agent_well_known",
+    "agent_access",
+    "agent_rsl",
+    "frontier",
+  ] as const;
+
+  /**
+   * What {@link retireCrawls} would delete, without deleting it.
+   *
+   * Counted rather than estimated: this is what a user sees before confirming
+   * that some of their audit history stops being renderable, so it must be the
+   * real number.
+   */
+  previewRetireCrawls(crawlIds: string[]): Effect.Effect<
+    { rowsByTable: Record<string, number>; supersededPages: number; totalRows: number },
+    StorageError,
+    never
+  > {
+    return Effect.try({
+      try: () => {
+        const rowsByTable: Record<string, number> = {};
+        let totalRows = 0;
+        if (crawlIds.length === 0)
+          return { rowsByTable, supersededPages: 0, totalRows: 0 };
+
+        const db = this.getDb();
+        const placeholders = crawlIds.map(() => "?").join(", ");
+        for (const table of SQLiteStorage.RETIREABLE_TABLES) {
+          const row = db
+            .prepare(
+              `SELECT COUNT(*) AS c FROM ${table} WHERE crawl_id IN (${placeholders})`
+            )
+            .get(...crawlIds) as { c: number };
+          if (row.c > 0) {
+            rowsByTable[table] = row.c;
+            totalRows += row.c;
+          }
+        }
+
+        const superseded = db
+          .prepare(this.supersededPagesSql("COUNT(*) AS c", placeholders))
+          .get(...crawlIds) as { c: number };
+        totalRows += superseded.c;
+        return { rowsByTable, supersededPages: superseded.c, totalRows };
+      },
+      catch: (e) => StorageError.read(e),
+    });
+  }
+
+  /**
+   * Pages belonging to the named crawls that a newer row already supersedes.
+   *
+   * `getCachedPage` reads `ORDER BY fetched_at DESC, rowid DESC LIMIT 1`, so a
+   * row with a newer sibling for the same url can never be returned by it. The
+   * predicate is that ordering, inverted — which is why these rows are dead to
+   * the crawler even though the crawl they belong to is being retired for a
+   * different reason. A page whose ONLY row belongs to a retired crawl is kept:
+   * it is still the freshest thing known about that url.
+   */
+  private supersededPagesSql(select: string, placeholders: string): string {
+    return `
+      SELECT ${select} FROM pages p
+      WHERE p.crawl_id IN (${placeholders})
+        AND EXISTS (
+          SELECT 1 FROM pages newer
+          WHERE newer.normalized_url = p.normalized_url
+            AND (
+              newer.fetched_at > p.fetched_at
+              OR (newer.fetched_at = p.fetched_at AND newer.rowid > p.rowid)
+            )
+        )
+    `;
+  }
+
+  /**
+   * Retire the derived output of the named crawls (#1912).
+   *
+   * Their reports stop being renderable and they are stamped `retired_at`, which
+   * is what lets `report` say so instead of rebuilding an empty one; the crawl
+   * rows remain, so the audits are still listed. Everything the NEXT crawl reads
+   * is preserved — see RETIREABLE_TABLES for what is excluded
+   * and why. One transaction, so a crash cannot leave a half-retired crawl that
+   * renders a partial report.
+   */
+  retireCrawls(
+    crawlIds: string[],
+    retiredAt: number = Date.now()
+  ): Effect.Effect<number, StorageError, never> {
+    // Never a crawl that is still being written. A prune racing a live audit
+    // would delete the frontier out from under it and leave a half-written run.
+    // Checked HERE rather than only in the caller so the guard cannot be
+    // bypassed by a future caller that forgets it.
+
+    return Effect.try({
+      try: () => {
+        if (crawlIds.length === 0) return 0;
+        const db = this.getDb();
+        const idList = crawlIds.map(() => "?").join(", ");
+        const active = db
+          .prepare(
+            `SELECT id FROM crawls WHERE id IN (${idList}) AND status NOT IN ('completed', 'analyzed', 'failed')`
+          )
+          .all(...crawlIds) as Array<{ id: string }>;
+        if (active.length > 0) {
+          throw new Error(
+            `Refusing to retire ${active.length} crawl(s) that are not finished: ${active
+              .map((c) => c.id)
+              .join(", ")}`
+          );
+        }
+        const placeholders = idList;
+        let deleted = 0;
+        const run = db.transaction(() => {
+          for (const table of SQLiteStorage.RETIREABLE_TABLES) {
+            const result = db
+              .prepare(
+                `DELETE FROM ${table} WHERE crawl_id IN (${placeholders})`
+              )
+              .run(...crawlIds);
+            deleted += Number(result.changes ?? 0);
+          }
+          const pageResult = db
+            .prepare(
+              `DELETE FROM pages WHERE rowid IN (${this.supersededPagesSql("p.rowid", placeholders)})`
+            )
+            .run(...crawlIds);
+          deleted += Number(pageResult.changes ?? 0);
+          // Stamp INSIDE the transaction, so a crash can never leave a crawl
+          // whose data is gone but which still reads as renderable. That state
+          // is worse than either end of it: the report path would rebuild a
+          // confident empty report from the pages that survive.
+          db.prepare(
+            `UPDATE crawls SET retired_at = ? WHERE id IN (${placeholders})`
+          ).run(retiredAt, ...crawlIds);
+        });
+        run();
+        return deleted;
+      },
+      catch: (e) => StorageError.write(e),
+    });
+  }
+
+  /**
+   * Rebuild the database file so deleted space returns to the filesystem.
+   *
+   * Separate from {@link retireCrawls} on purpose: SQLite only moves freed pages
+   * to a freelist, so without this the file never shrinks, and VACUUM rewrites
+   * the whole file, which is far too expensive to run as part of an audit
+   * (#1908 is what happens when a per-audit full pass slips in).
+   */
+  vacuum(): Effect.Effect<void, StorageError, never> {
+    return Effect.try({
+      try: () => {
+        const db = this.getDb();
+        db.exec("VACUUM");
+        // In WAL mode the rewrite lands in the write-ahead log, so without this
+        // the main file shrinks and the `-wal` beside it grows by more than was
+        // saved: a prune measured 189 MB before and 239 MB after. TRUNCATE
+        // folds the log back in and takes it to zero, which is what makes the
+        // reclaimed space real rather than moved.
+        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      },
+      catch: (e) => StorageError.write(e),
+    });
   }
 
   getCrawlByUrl(
