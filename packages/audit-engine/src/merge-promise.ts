@@ -25,17 +25,65 @@ import { normalizeUrl } from "@squirrelscan/utils/url";
 
 import {
   computeMerge,
+  createMergeSession,
   flattenChecks,
   type FlatFinding,
+  type MergedFinding,
   type MergedState,
   type MergeResolutionInput,
 } from "./merge-core";
-import { reconstructCompleteResults } from "./reconstruct";
+import {
+  createCompleteStoreTallyFold,
+  foldCompleteStoreTallies,
+  type FindingPageSource,
+} from "./complete-store-fold";
 import type { SkippedPassCounts } from "./stream-findings";
-import { buildScoringResultsFromMerged, type CarriedFinding } from "./scoring";
+import {
+  buildScoringResultsFromMerged,
+  type CarriedFinding,
+  type CarriedUnionSource,
+  type RuleTally,
+} from "./scoring";
+
 
 /** 404/410 = page gone → stale its findings (not carry). */
 const REMOVED_STATUSES = new Set([404, 410]);
+
+/**
+ * Rows buffered before a merge flush (#1876).
+ *
+ * MEASURED, and smaller than it looks like it should be. The flush's cost is not
+ * the rows it holds but the transient graph the driver builds around them — an
+ * insert of 500 findings is 8,500 bound parameters plus a dictionary insert — and
+ * that spike lands on top of whatever the page loop is holding. Halving the batch
+ * took ~15 MiB off the finalize's peak at 60,000 carried findings, for round trips
+ * that cost single-digit milliseconds each.
+ */
+const MERGE_PERSIST_BATCH = 200;
+
+/**
+ * One page's OPEN findings, split by which audit last saw them (#1876).
+ *
+ * Both halves come from ONE cursor over `page_findings`, which is what makes the
+ * fold's page-boundary contract structural: a page's fresh evidence and the
+ * findings earlier audits left on it are handed over together, so they cannot land
+ * in two different `addChecksToTally` calls. Two independent cursors could not
+ * promise that without comparing URLs across them in JS, and JS string order is not
+ * the database's collation.
+ */
+export interface OpenFindingPage {
+  normalizedUrl: string;
+  /** Ingested by THIS audit (`lastSeenCrawlId === crawlId`). */
+  fresh: readonly PageFindingRecord[];
+  /** Left open by an EARLIER audit — the merge decides carry/resolve/stale. */
+  prior: readonly PageFindingRecord[];
+}
+
+/** Pages in `normalizedUrl` order, each yielded exactly once and never split. */
+export type OpenFindingPageSource = AsyncIterable<OpenFindingPage>;
+
+/** Prior findings a page at a time; a page must never be split across two items. */
+export type PriorFindingPageSource = AsyncIterable<readonly PageFindingRecord[]>;
 
 /**
  * Narrow Promise port of the smart-audits store surface. A backing store
@@ -45,6 +93,19 @@ const REMOVED_STATUSES = new Set([404, 410]);
 export interface SmartAuditStore {
   /** Findings for a site, optionally restricted to lifecycle `states`. */
   getFindings(siteKey: string, states?: FindingState[]): Promise<PageFindingRecord[]>;
+  /**
+   * (#1876) OPTIONAL page-at-a-time cursor over the same rows {@link getFindings}
+   * returns. When a store offers it, the merge decides carry/resolve/stale in
+   * bounded batches instead of over one array — which is the difference between a
+   * partial re-audit of a site with 60,000 open findings costing hundreds of MB and
+   * costing tens. A page's findings must never be split across two yields.
+   *
+   * Optional so an in-memory store (tests, fixtures) needs only `getFindings`.
+   */
+  streamFindingPages?(
+    siteKey: string,
+    states?: FindingState[],
+  ): PriorFindingPageSource;
   getSitePages(siteKey: string): Promise<SitePageRecord[]>;
   upsertFindings(findings: PageFindingRecord[]): Promise<void>;
   upsertSitePages(pages: SitePageRecord[]): Promise<void>;
@@ -80,6 +141,14 @@ export interface MergeFindingsPromiseInput {
   sampledCheckPages?: Map<string, Set<string>>;
   /** (#1185) Pre-indexed publish resolution signal — see {@link ComputeMergeInput.resolution}. */
   resolution?: MergeResolutionInput;
+  /**
+   * (#1873) Prior OPEN findings, already loaded by the caller — skips the
+   * `store.getFindings(siteKey, ["open"])` read. The complete-store finalize uses
+   * it to pass the findings this audit did NOT re-observe: the chunk ingest has
+   * already upserted every re-observed finding under this run's crawlId, so the
+   * store read would return the whole audit a second time.
+   */
+  priorFindings?: PageFindingRecord[];
 }
 
 /**
@@ -87,8 +156,8 @@ export interface MergeFindingsPromiseInput {
  * via the store, then run the pure {@link computeMerge}.
  */
 export async function mergeFindingsPromise(input: MergeFindingsPromiseInput): Promise<MergedState> {
-  const { store, siteKey, now, ...rest } = input;
-  const priorFindings = await store.getFindings(siteKey, ["open"]);
+  const { store, siteKey, now, priorFindings: preloaded, ...rest } = input;
+  const priorFindings = preloaded ?? (await store.getFindings(siteKey, ["open"]));
   const priorPages = await store.getSitePages(siteKey);
   return computeMerge({
     ...rest,
@@ -129,8 +198,34 @@ export interface CloudSmartAuditsInput {
    * page's absence from the fresh set authoritative — so both are skipped.
    */
   completeStore?: {
-    /** Complete per-(page,rule,check,locator) findings for this audit. */
-    ingestedFindings: PageFindingRecord[];
+    /**
+     * (#1873) Complete per-(page,rule,check,locator) findings for this audit,
+     * delivered ONE PAGE AT A TIME and folded into per-rule tallies rather than
+     * materialized — a 43k-finding audit does not fit in the 128 MB API isolate.
+     * See {@link FindingPageSource} for the page-boundary contract.
+     *
+     * Pair with {@link priorOpenFindings}, or supply {@link openPages} instead.
+     */
+    findingPages?: FindingPageSource;
+    /**
+     * (#1873) Prior OPEN findings for the site EXCLUDING the rows this audit's
+     * chunk ingest wrote. Those rows are the fresh evidence (already persisted, and
+     * folded from `findingPages`), so loading them as "prior" would both double the
+     * isolate's memory and make the merge reason about this run's own findings as if
+     * a previous run had left them.
+     *
+     * MATERIALIZED, so it is bounded by the site's whole open backlog rather than by
+     * this run — the #1876 OOM. Prefer {@link openPages}.
+     */
+    priorOpenFindings?: PageFindingRecord[];
+    /**
+     * (#1876) Both halves of the site's open findings from ONE cursor, a page at a
+     * time — the bounded replacement for `findingPages` + `priorOpenFindings`, and
+     * what the API's finalize supplies. When set, those two are ignored: the merge
+     * decides each prior as it goes past, the fold folds the page's fresh and
+     * carried findings together, and the rows are dropped.
+     */
+    openPages?: OpenFindingPageSource;
     /** Full crawled-URL list (`resolutionSignal.crawledUrls`); normalized here. */
     crawledUrls: string[];
     /**
@@ -145,8 +240,25 @@ export interface CloudSmartAuditsInput {
 }
 
 export interface CloudSmartAuditsResult {
-  /** UNION rule results (fresh + carried) for authoritative scoring + report. */
+  /**
+   * UNION rule results (fresh + carried) for authoritative scoring + report.
+   *
+   * (#1873) In COMPLETE-STORE mode this is the REPORT surface only: page-scope
+   * rules carry the staged shell's bounded checks (the container's
+   * `slimPageChecksForShell` aggregates, which keep every affected page as
+   * `details.occurrences` + `pagesTruncated`) plus the carried replays — NOT one
+   * check per affected page. The authoritative numbers come from
+   * {@link scoringTallies} instead, which sees every page.
+   */
   unionRuleResults: Map<string, RuleRunResult>;
+  /**
+   * (#1873) Per-rule folded tallies over the COMPLETE findings — present ONLY in
+   * complete-store mode. When set, the caller MUST take the health score
+   * (`calculateHealthScoreFromTallies`) and the passed/warnings/failed totals from
+   * these, not from {@link unionRuleResults}: the tallies count every affected
+   * page, the union map only lists the shell's sample.
+   */
+  scoringTallies?: Map<string, RuleTally>;
   /** Coverage line data for surfacing. */
   coverage: {
     auditedPages: number;
@@ -229,14 +341,15 @@ export async function runCloudSmartAudits(
     for (const u of completeStore.crawledUrls) crawledUrls.add(normalizeUrl(u));
     for (const u of statusByUrl.keys()) crawledUrls.add(u);
     for (const u of removedUrls) crawledUrls.delete(u);
-    // Reconstruct AFTER crawledUrls is final — the per-rule syntheticPassCount
-    // denominator (crawled − failing pages) is measured against it.
-    freshResults = reconstructCompleteResults({
-      ruleResults: input.ruleResults,
-      ingestedFindings: completeStore.ingestedFindings,
-      crawledUrls,
-      skippedPassCounts: completeStore.skippedPassCounts,
-    });
+    // (#1873) NOT reconstructed here. The complete findings are folded into
+    // per-rule tallies page at a time (below, after the merge), so nothing
+    // audit-sized is ever resident. `freshResults` keeps the SHELL's rules: they
+    // are the report surface and the site-scope rules' checks, exactly what the
+    // materialized reconstruction passed through untouched.
+    freshResults = new Map<string, RuleRunResult>();
+    for (const [ruleId, r] of Object.entries(input.ruleResults)) {
+      freshResults.set(ruleId, { meta: r.meta, checks: r.checks });
+    }
   } else {
     // A published report arrives already folded (#910): an over-cap per-rule
     // check array is collapsed into per-issue-class aggregates that carry every
@@ -286,22 +399,31 @@ export async function runCloudSmartAudits(
   // Flatten fresh page-scope fail/warn checks into findings, grouped per page
   // (flattenChecks stamps one normalizedUrl across the checks it's given). Skip
   // pages removed this run — they're gone, not active issues.
+  // (#1873) Complete mode flattens NOTHING: the chunk ingest already persisted
+  // this run's findings (same rows, same PK, and the store's LEAST(first_seen)
+  // conflict rule already preserved the earliest first-seen), so re-deriving them
+  // from the shell would both re-materialize the audit and re-write rows that are
+  // already correct. The merge below therefore sees an empty fresh set and treats
+  // the prior OPEN findings the caller passed — which EXCLUDE this run's ingest —
+  // as the only rows needing a resolve/carry/stale decision.
   const freshFindings: FlatFinding[] = [];
-  for (const [ruleId, r] of freshResults) {
-    const byUrl = new Map<string, CheckResult[]>();
-    for (const c of r.checks) {
-      if (!c.pageUrl) continue; // site-scope check — not a per-page finding
-      const u = normalizeUrl(c.pageUrl);
-      if (removedUrls.has(u)) continue;
-      let arr = byUrl.get(u);
-      if (!arr) {
-        arr = [];
-        byUrl.set(u, arr);
+  if (!completeStore) {
+    for (const [ruleId, r] of freshResults) {
+      const byUrl = new Map<string, CheckResult[]>();
+      for (const c of r.checks) {
+        if (!c.pageUrl) continue; // site-scope check — not a per-page finding
+        const u = normalizeUrl(c.pageUrl);
+        if (removedUrls.has(u)) continue;
+        let arr = byUrl.get(u);
+        if (!arr) {
+          arr = [];
+          byUrl.set(u, arr);
+        }
+        arr.push(c);
       }
-      arr.push(c);
-    }
-    for (const [u, checks] of byUrl) {
-      freshFindings.push(...flattenChecks(u, ruleId, checks));
+      for (const [u, checks] of byUrl) {
+        freshFindings.push(...flattenChecks(u, ruleId, checks));
+      }
     }
   }
 
@@ -333,19 +455,163 @@ export async function runCloudSmartAudits(
     };
   }
 
-  const merged = await mergeFindingsPromise({
-    store,
-    siteKey,
-    crawlId,
-    crawledUrls,
-    freshFindings,
-    removedUrls,
-    severityByRule,
-    statusByUrl,
-    now,
-    sampledCheckPages,
-    resolution,
-  });
+  // ── merge ────────────────────────────────────────────────────────────────
+  //
+  // (#1876) Prior findings stream past the merge rather than being loaded into an
+  // array. The session settles the site's page set up front (it reads `priorPages`,
+  // never a prior FINDING), which is what lets `carriedPageUrls` — and with it the
+  // carried scoring fold — exist before the first prior arrives.
+  const priorPages = await store.getSitePages(siteKey);
+  let onPersist: (record: PageFindingRecord) => void = () => {};
+  let onActive: (finding: MergedFinding) => void = () => {};
+  const session = createMergeSession(
+    {
+      siteKey,
+      crawlId,
+      crawledUrls,
+      freshFindings,
+      removedUrls,
+      severityByRule,
+      statusByUrl,
+      priorPages,
+      now,
+      sampledCheckPages,
+      resolution,
+    },
+    {
+      persist: (record) => onPersist(record),
+      active: (finding) => onActive(finding),
+    },
+  );
+
+  // Carried pages = every active page NOT (re-)crawled this run (incl. clean
+  // ones, so the union scorer can emit synthetic passes for them).
+  const carriedPageUrls = new Set<string>();
+  for (const url of session.activePageUrls) {
+    if (!crawledUrls.has(url)) carriedPageUrls.add(url);
+  }
+
+  const streamedComplete = completeStore?.openPages;
+  // Writing as the merge streams is safe ONLY when the reader is a cursor that has
+  // already passed the rows being written (it reads each page once, and the merge
+  // only ever writes rows behind it). The materialized complete path reads its
+  // fresh side from a SECOND source after the merge, so there it must still be
+  // "fold first, then persist" — `computeMerge` stamps resolved rows with this
+  // run's crawl id, and a fold that ran after them would read one back as fresh
+  // evidence that the page still fails.
+  const persistWhileStreaming = !completeStore || !!streamedComplete;
+
+  let persistedFindings = 0;
+  const pendingWrites: PageFindingRecord[] = [];
+  const deferredWrites: PageFindingRecord[] = [];
+  const flushWrites = async (): Promise<void> => {
+    if (pendingWrites.length > 0) await store.upsertFindings(pendingWrites.splice(0));
+  };
+  onPersist = (record) => {
+    persistedFindings += 1;
+    // Findings on a page that 404/410'd are staled transactionally by
+    // `markPagesRemoved` below, so the row written here would be overwritten.
+    if (removedUrls.has(record.normalizedUrl)) return;
+    (persistWhileStreaming ? pendingWrites : deferredWrites).push(record);
+  };
+
+  // Carried findings, SPLIT by whether any audit has ever rendered the page
+  // (#1652): a never-rendered page's finding was not inherited from a previous run,
+  // so it must not be counted as carried nor given a last-seen date implying an
+  // earlier observation.
+  let carriedCount = 0;
+  let unrenderedCount = 0;
+  const carriedLastSeen = new Map<string, number>();
+  // Materialized only off the streaming path: there the union IS the score, and it
+  // is bounded by the run rather than by the site's backlog.
+  const carriedFindings: CarriedFinding[] = [];
+  const pageCarried: CarriedFinding[] = [];
+
+  let scoringTallies: Map<string, RuleTally> | undefined;
+  let carriedSource: CarriedUnionSource | undefined;
+
+  if (streamedComplete) {
+    const fold = createCompleteStoreTallyFold({
+      ruleResults: input.ruleResults,
+      crawledUrls,
+      skippedPassCounts: completeStore.skippedPassCounts,
+      carriedPageUrls,
+      ruleMetaIndex,
+      // Same exclusion the union scoring applies below via `freshForUnion`: a
+      // page that 404/410'd this run is not one of the known non-removed pages.
+      removedUrls,
+      // The report body's carried side comes out of the same replay, bounded.
+      retainCarriedChecks: true,
+    });
+    onActive = (finding) => {
+      if (finding.provenance !== "carried") return;
+      carriedCount += 1;
+      if (finding.neverRendered) unrenderedCount += 1;
+      // No copy: `MergedFinding` already carries every field `CarriedFinding`
+      // reads, `lastSeenAt` included — which is what stamps the replayed check
+      // (#1876). One fewer object per carried finding, on the path where that
+      // multiplies by the whole backlog.
+      pageCarried.push(finding);
+    };
+    for await (const page of streamedComplete) {
+      pageCarried.length = 0;
+      session.addPriorFindings(page.prior);
+      fold.foldPage(page.normalizedUrl, page.fresh, pageCarried);
+      if (pendingWrites.length >= MERGE_PERSIST_BATCH) await flushWrites();
+    }
+    // Complete mode passes no fresh findings (the ingest already persisted them),
+    // so this is normally empty — driven anyway so the contract holds either way.
+    for (const record of session.finish().persisted) onPersist(record);
+    await flushWrites();
+    fold.foldShellRules();
+    scoringTallies = fold.finish();
+    carriedSource = fold.carriedUnion();
+  } else {
+    onActive = (finding) => {
+      if (finding.provenance !== "carried") return;
+      carriedCount += 1;
+      const carried = toCarriedFinding(finding);
+      carriedFindings.push(carried);
+      if (finding.neverRendered) {
+        unrenderedCount += 1;
+        return;
+      }
+      carriedLastSeen.set(
+        carriedKey(finding.normalizedUrl, finding.ruleId, finding.checkName),
+        finding.lastSeenAt,
+      );
+    };
+    for await (const batch of priorFindingPages(store, siteKey, completeStore?.priorOpenFindings)) {
+      session.addPriorFindings(batch);
+      if (persistWhileStreaming && pendingWrites.length >= MERGE_PERSIST_BATCH) {
+        await flushWrites();
+      }
+    }
+    for (const record of session.finish().persisted) onPersist(record);
+    if (persistWhileStreaming) await flushWrites();
+
+    // (#1873) COMPLETE mode, materialized inputs: fold this audit's findings into
+    // per-rule tallies, page at a time, off the caller's fresh source.
+    //
+    // ORDER IS LOAD-BEARING — this MUST run before the deferred writes below.
+    if (completeStore) {
+      scoringTallies = await foldCompleteStoreTallies({
+        ruleResults: input.ruleResults,
+        findingPages: completeStore.findingPages ?? emptyPageSource(),
+        crawledUrls,
+        skippedPassCounts: completeStore.skippedPassCounts,
+        carriedFindings,
+        carriedPageUrls,
+        ruleMetaIndex,
+        removedUrls,
+      });
+      // Pushed one at a time: a spread of a whole site's backlog is an argument
+      // list, and an argument list has a limit an array does not.
+      for (const record of deferredWrites) pendingWrites.push(record);
+      deferredWrites.length = 0;
+      await flushWrites();
+    }
+  }
 
   // Persist: removed pages (transactional stale) first, then the rest. One tx
   // for the whole removed set rather than one round-trip per url (#288).
@@ -354,48 +620,15 @@ export async function runCloudSmartAudits(
     lastStatus: statusByUrl.get(url) ?? 404,
   }));
   await store.markPagesRemoved(siteKey, removedPages, crawlId);
-  await store.upsertFindings(merged.persisted.filter((f) => !removedUrls.has(f.normalizedUrl)));
-  await store.upsertSitePages(merged.sitePages.filter((p) => !removedUrls.has(p.normalizedUrl)));
+  await store.upsertSitePages(
+    session.sitePages.filter((p) => !removedUrls.has(p.normalizedUrl)),
+  );
   // Best-effort hygiene — only ever prunes terminal rows, never open/carried, so
   // it can't affect the merged report. NEVER fail the audit on a prune error.
   try {
     await store.compactFindings(siteKey);
   } catch {
     // degrade to "no pruning this run"
-  }
-
-  // Carried pages = every active page NOT (re-)crawled this run (incl. clean
-  // ones, so the union scorer can emit synthetic passes for them).
-  const carriedPageUrls = new Set<string>();
-  for (const url of merged.activePageUrls) {
-    if (!crawledUrls.has(url)) carriedPageUrls.add(url);
-  }
-
-  // Carried findings = active (open) findings on those carried pages, SPLIT by
-  // whether any audit has ever rendered the page (#1652): a never-rendered page's
-  // finding was not inherited from a previous run, so it must not be counted as
-  // carried nor given a last-seen date implying an earlier observation.
-  const carriedFindings: CarriedFinding[] = [];
-  const carriedLastSeen = new Map<string, number>();
-  let unrenderedCount = 0;
-  for (const f of merged.findings) {
-    if (f.provenance !== "carried") continue;
-    carriedFindings.push({
-      normalizedUrl: f.normalizedUrl,
-      ruleId: f.ruleId,
-      checkName: f.checkName,
-      status: f.status,
-      message: f.message,
-      value: f.value,
-      expected: f.expected,
-      payload: f.payload,
-      neverRendered: f.neverRendered,
-    });
-    if (f.neverRendered) {
-      unrenderedCount++;
-      continue;
-    }
-    carriedLastSeen.set(carriedKey(f.normalizedUrl, f.ruleId, f.checkName), f.lastSeenAt);
   }
 
   // Drop checks for removed (404/410) pages from the fresh results before union
@@ -427,19 +660,71 @@ export async function runCloudSmartAudits(
     carriedFindings,
     carriedPageUrls,
     ruleMetaIndex,
+    ...(carriedSource ? { carriedSource } : {}),
   });
 
   return {
     unionRuleResults,
+    ...(scoringTallies ? { scoringTallies } : {}),
     coverage: {
       auditedPages: crawledUrls.size,
-      knownPages: merged.activePageUrls.size,
-      carriedFindings: carriedFindings.length - unrenderedCount,
+      knownPages: session.activePageUrls.size,
+      carriedFindings: carriedCount - unrenderedCount,
       ...(unrenderedCount > 0 ? { unrenderedFindings: unrenderedCount } : {}),
     },
     carriedLastSeen,
-    persistedFindings: merged.persisted.length,
+    persistedFindings,
     removedPages: removedUrls.size,
     completeStore: !!completeStore,
+  };
+}
+
+/** No fresh side at all — a complete-store caller that passed only priors. */
+async function* emptyPageSource(): FindingPageSource {
+  // Intentionally yields nothing.
+}
+
+/**
+ * Prior OPEN findings, page at a time: the caller's own set when it supplied one
+ * (the complete-store finalize excludes this audit's ingest), else the store's
+ * cursor, else one array from `getFindings` for stores without a cursor.
+ */
+async function* priorFindingPages(
+  store: SmartAuditStore,
+  siteKey: string,
+  preloaded: PageFindingRecord[] | undefined,
+): PriorFindingPageSource {
+  if (preloaded) {
+    if (preloaded.length > 0) yield preloaded;
+    return;
+  }
+  if (store.streamFindingPages) {
+    yield* store.streamFindingPages(siteKey, ["open"]);
+    return;
+  }
+  const all = await store.getFindings(siteKey, ["open"]);
+  if (all.length > 0) yield all;
+}
+
+/**
+ * The merge's view of a carried finding, reduced to what the scorers replay.
+ *
+ * The SAMPLED path only, and the reduction is the point: dropping `lastSeenAt`
+ * is what keeps the replayed check untagged there, so the caller's
+ * `carriedLastSeen` pass still does the tagging its callers assert. The streaming
+ * path passes the `MergedFinding` straight through instead — it has no such map to
+ * tag from, and building one would be the allocation #1876 exists to remove.
+ */
+function toCarriedFinding(f: MergedFinding): CarriedFinding {
+  return {
+    normalizedUrl: f.normalizedUrl,
+    ruleId: f.ruleId,
+    checkName: f.checkName,
+    status: f.status,
+    message: f.message,
+    value: f.value,
+    expected: f.expected,
+    payload: f.payload,
+    neverRendered: f.neverRendered,
   };
 }

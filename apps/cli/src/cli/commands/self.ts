@@ -320,6 +320,261 @@ const selfDoctor = defineCommand({
   },
 });
 
+/**
+ * `self disk --prune --keep N`: retire audits beyond the newest N and give the
+ * space back (#1912).
+ *
+ * Deliberately awkward to fire by accident. `--keep` has no default because
+ * retiring a crawl makes its report unrenderable and `report --list`, `--diff`
+ * and `--regression-since` all reach into that history; the plan is printed and
+ * confirmed before anything is deleted; and `--dry-run` stops after printing.
+ */
+async function runPrune(
+  args: {
+    keep?: string;
+    project?: string;
+    "dry-run"?: boolean;
+    yes?: boolean;
+  },
+  deps: {
+    formatBytes: (bytes: number) => string;
+    planProjectPrune: typeof import("@/self/disk").planProjectPrune;
+    runProjectPrune: typeof import("@/self/disk").runProjectPrune;
+  }
+): Promise<void> {
+  const { formatBytes, planProjectPrune, runProjectPrune } = deps;
+  const { existsSync, readdirSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { getProjectsPath } = await import("@/self/paths");
+
+  // Whole-string match, not parseInt: `parseInt("1e3")` is 1, so `--keep 1e3
+  // --yes` would keep ONE audit and delete the rest of a user's history while
+  // reading as a request to keep a thousand. Same class as the batch-budget
+  // parser in audit/stream-batch.ts.
+  const raw = String(args.keep ?? "").trim();
+  const keep = /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!Number.isSafeInteger(keep) || keep < 1) {
+    console.error(
+      "--prune needs --keep <n>, at least 1: the audits beyond the newest n stop being renderable,\n" +
+        "so there is no default that would be safe to guess."
+    );
+    process.exit(1);
+  }
+
+  const root = getProjectsPath();
+  const names = existsSync(root)
+    ? readdirSync(root, { withFileTypes: true, encoding: "utf8" })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .filter((n) => !args.project || n === args.project)
+        .sort()
+    : [];
+
+  if (args.project && names.length === 0) {
+    console.error(`No project directory named ${args.project} under ${root}`);
+    process.exit(1);
+  }
+
+  const plans = [];
+  for (const name of names) {
+    const plan = await planProjectPrune(join(root, name, "project.db"), keep);
+    if (plan) plans.push({ name, plan });
+  }
+
+  if (plans.length === 0) {
+    console.log(
+      `Nothing to retire or reclaim: every project holds at most ${keep} ` +
+        "audit(s), with no space waiting to be returned."
+    );
+    return;
+  }
+
+  const date = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  console.log(`Keeping the newest ${keep} audit(s) per project.\n`);
+  let rows = 0;
+  let reclaimable = 0;
+  // What the user is confirming is whether AUDITS are retired, not whether rows
+  // are deleted. An audit outside the window with nothing deletable left in it
+  // is still stamped retired and still stops opening, so the count of audits is
+  // what decides the wording and the question. A project an audit already
+  // retired has neither, and is still holding the space those deletes freed:
+  // saying "retiring 0 audits" would read as a no-op when running it is the
+  // whole point.
+  let retiringAudits = 0;
+  for (const { name, plan } of plans) {
+    rows += plan.rows;
+    reclaimable += plan.reclaimableBytes;
+    retiringAudits += plan.retiring.length;
+    const what =
+      plan.retiring.length > 0
+        ? `retiring ${plan.retiring.length} of ${
+            plan.retiring.length + plan.keeping
+          } audits`
+        : `rebuilding to return ${formatBytes(plan.reclaimableBytes)}`;
+    console.log(`${name}  ${formatBytes(plan.bytesBefore)}  ${what}`);
+    for (const crawl of plan.retiring) {
+      console.log(`    ${date(crawl.startedAt)}  ${crawl.id.slice(0, 8)}`);
+    }
+  }
+  console.log(
+    retiringAudits > 0
+      ? `\n${retiringAudits} audit(s) and ${rows.toLocaleString()} rows across ` +
+          `${plans.length} project(s). Their reports stop being renderable; ` +
+          "the audits stay listed."
+      : `\nNothing left to retire: ${formatBytes(reclaimable)} across ` +
+          `${plans.length} project(s) is already free inside the files and ` +
+          "only a rebuild returns it."
+  );
+
+  if (args["dry-run"]) {
+    console.log("\nDry run: nothing was deleted.");
+    return;
+  }
+
+  if (!args.yes) {
+    const { createInterface } = await import("node:readline");
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    const answer = await new Promise<string>((resolve) => {
+      rl.question(
+        retiringAudits > 0 ? "\nRetire them? [y/N] " : "\nRebuild? [y/N] ",
+        resolve
+      );
+    });
+    rl.close();
+    if (answer.trim().toLowerCase() !== "y") {
+      console.log("Cancelled.");
+      return;
+    }
+  }
+
+  let before = 0;
+  let after = 0;
+  for (const { name, plan } of plans) {
+    const result = await runProjectPrune(plan);
+    before += result.bytesBefore;
+    after += result.bytesAfter;
+    console.log(
+      `${name}: ${formatBytes(result.bytesBefore)} -> ${formatBytes(result.bytesAfter)}`
+    );
+  }
+  console.log(`\nReclaimed ${formatBytes(Math.max(0, before - after))}.`);
+}
+
+const selfDisk = defineCommand({
+  meta: {
+    name: "disk",
+    description: "Report what ~/.squirrel is using, per project and in total",
+  },
+  args: {
+    json: {
+      type: "boolean",
+      description: "Emit the usage as JSON",
+    },
+    limit: {
+      type: "string",
+      description: "Show at most this many projects (default 15)",
+    },
+    prune: {
+      type: "boolean",
+      description:
+        "Retire audits beyond --keep and reclaim the space (requires --keep)",
+    },
+    keep: {
+      type: "string",
+      description:
+        "How many recent audits per project stay renderable. No default: this deletes report history, so it must be said out loud",
+    },
+    project: {
+      type: "string",
+      description: "Limit --prune to one project (its directory name)",
+    },
+    "dry-run": {
+      type: "boolean",
+      description: "With --prune, list what would go and stop",
+    },
+    yes: {
+      type: "boolean",
+      description: "Skip the confirmation prompt",
+    },
+  },
+  async run({ args }) {
+    const { collectDiskUsage, formatBytes, planProjectPrune, runProjectPrune } =
+      await import("@/self/disk");
+
+    if (args.prune) {
+      return runPrune(args, { formatBytes, planProjectPrune, runProjectPrune });
+    }
+
+    const result = collectDiskUsage();
+    if (!result.ok) {
+      console.error(`Error: ${result.error.message}`);
+      process.exit(1);
+    }
+    const usage = result.data;
+
+    if (args.json) {
+      console.log(JSON.stringify(usage, null, 2));
+      return;
+    }
+
+    const limit = Number.parseInt(String(args.limit ?? "15"), 10);
+    const shown = usage.projects.slice(
+      0,
+      Number.isFinite(limit) && limit > 0 ? limit : 15
+    );
+
+    console.log("Projects");
+    if (shown.length === 0) {
+      console.log("  (none)");
+    }
+    for (const project of shown) {
+      const detail = project.unreadable
+        ? "unreadable"
+        : `${project.crawls} audit${project.crawls === 1 ? "" : "s"}`;
+      console.log(
+        `  ${formatBytes(project.bytes).padStart(9)}  ${project.name}  (${detail})`
+      );
+    }
+    const hidden = usage.projects.length - shown.length;
+    if (hidden > 0) console.log(`  ... and ${hidden} more`);
+
+    console.log("\nTotals");
+    console.log(`  ${formatBytes(usage.projectsBytes).padStart(9)}  projects`);
+    console.log(
+      `  ${formatBytes(usage.contentStoreBytes).padStart(9)}  content store (shared)`
+    );
+    console.log(
+      `  ${formatBytes(usage.linkCacheBytes).padStart(9)}  link cache (shared)`
+    );
+    console.log(`  ${formatBytes(usage.releasesBytes).padStart(9)}  releases`);
+    console.log(`  ${formatBytes(usage.logsBytes).padStart(9)}  logs`);
+    console.log(`  ${formatBytes(usage.totalBytes).padStart(9)}  total`);
+
+    // Said once, about the biggest project, with the reason. `rule_results` is
+    // about 204 rows per page per audit, so the audits a project is holding are
+    // most of what it costs. The window itself lives in each project's
+    // squirrel.toml rather than in the database, so this names the setting
+    // instead of claiming a number it cannot know from here.
+    const repeated = usage.projects.filter((p) => p.crawls > 1);
+    if (repeated.length > 0) {
+      const worst = repeated[0]!;
+      const retired =
+        worst.retiredCrawls > 0
+          ? `, ${worst.retiredCrawls} already retired`
+          : "";
+      console.log(
+        `\n${worst.name} holds ${worst.crawls} audits${retired} ` +
+          `(${worst.ruleResultRows.toLocaleString()} rule results). An audit ` +
+          `retires the ones outside [storage] keep_audits (default 3); this ` +
+          `command is what returns their space to the filesystem.`
+      );
+    }
+  },
+});
+
 const selfVersion = defineCommand({
   meta: {
     name: "version",
@@ -625,6 +880,7 @@ export const self = defineCommand({
     description: "Self-management commands",
   },
   subCommands: {
+    disk: selfDisk,
     install: selfInstall,
     update: selfUpdate,
     completion: selfCompletion,

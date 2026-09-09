@@ -3,8 +3,15 @@
 
 import { Effect, Stream, PubSub, Duration, Deferred } from "effect";
 
-import type { LinkData, SitemapData } from "@squirrelscan/core-contracts";
+import type {
+  AuditFailureDetail,
+  AuditFailureSource,
+  FrontierSource,
+  LinkData,
+  SitemapData,
+} from "@squirrelscan/core-contracts";
 import { isCacheHitReason } from "@squirrelscan/core-contracts";
+import { auditFailureDetail } from "@squirrelscan/core-contracts/failure-reason";
 import { COVERAGE_PAGE_LIMITS, REPORT_LIMITS } from "@squirrelscan/core-contracts/limits";
 
 import { extractCrawlableUrls } from "@squirrelscan/parser/extractors";
@@ -47,7 +54,12 @@ import type {
 } from "./types";
 
 import { createHostBackoff, type HostBackoffRegistry } from "../host-backoff";
-import { fetchPageWithRetry, type CrawlFetcher, type RateLimitControl } from "../fetcher";
+import {
+  crawlErrorToFailureDetail,
+  fetchPageWithRetry,
+  type CrawlFetcher,
+  type RateLimitControl,
+} from "../fetcher";
 import { normalizeUrl, isInScope, isOffSiteFinalUrl, resolveSeedRedirect } from "../frontier";
 import {
   buildConditionalHeaders,
@@ -56,7 +68,7 @@ import {
   isNotModifiedResponse,
   type FreshReason,
 } from "../incremental";
-import { StorageCacheStore } from "../cache-store";
+import { StorageCacheStore, type CacheStore } from "../cache-store";
 import {
   createPatternStats,
   getPatternStats,
@@ -83,6 +95,42 @@ import { createTestStorage } from "../storage";
 import { DEFAULT_CRAWLER_CONFIG, CrawlerError } from "./types";
 
 const PATTERN_SAMPLE_LIMIT = 1;
+/**
+ * Which fetch a root failure came from (#1822). The frontier's own `seed`
+ * source is the audited entry URL; everything else reaching a zero-page crawl
+ * came from sitemap discovery, so it is reported as the weaker `sitemap`
+ * source and only used when the seed itself recorded nothing.
+ */
+function failureSourceFor(source: FrontierSource): AuditFailureSource {
+  return source === "seed" ? "entry" : "sitemap";
+}
+
+/**
+ * Host for a failure reason. `urlHostKey` answers the literal string "unknown"
+ * for an unparseable URL, which would render as a hostname in the sentence
+ * ("unknown returned 404"); drop it so the reason falls back to "the site".
+ */
+function failureHostOf(url: string): string | undefined {
+  const host = urlHostKey(url);
+  return host === "unknown" ? undefined : host;
+}
+
+/**
+ * Keep the most explanatory root failure (#1822): the first one recorded wins,
+ * except that a failure on the audited entry URL always displaces one picked up
+ * from a sitemap URL. Order matters because sitemap URLs and the seed are both
+ * enqueued at depth 0 and can be processed in either order.
+ */
+function preferRootFailure(
+  current: AuditFailureDetail | undefined,
+  incoming: AuditFailureDetail | undefined,
+): AuditFailureDetail | undefined {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (current.source !== "entry" && incoming.source === "entry") return incoming;
+  return current;
+}
+
 // Hard cap on robots.txt Crawl-delay when respectRobots is true (#790).
 // WP Engine/Yoast sites commonly ship "Crawl-delay: 10", which stretched a
 // 25-page quick audit past 4 minutes of pure sleep.
@@ -256,6 +304,22 @@ export interface CreateCrawlerOptions {
   parsedPageCache?: ParsedPageCache;
   // Opt-in: injectable fetch seam; defaults to the real fetchPageWithRetry (#315)
   fetcher?: CrawlFetcher;
+  /**
+   * Opt-in: injectable cache seam; defaults to {@link StorageCacheStore} over
+   * `storage` (#1899).
+   *
+   * The default reads the previous crawl straight out of the same SQLite the
+   * current crawl writes, which is why a CLI re-run is near free and a cloud
+   * run is not: a cloud container starts with an empty database, so there is
+   * nothing to revalidate against. A caller that HAS a previous crawl
+   * elsewhere supplies a store that can reach it.
+   *
+   * Anything reached over a network belongs behind this seam rather than in the
+   * crawl loop: the loop asks for one URL at a time, so an implementation that
+   * fetches a body per lookup keeps residency at one page, and a lookup that
+   * fails or returns `{ entry: null }` simply costs a normal fetch.
+   */
+  cacheStore?: CacheStore;
 }
 
 export function createCrawler(
@@ -305,6 +369,19 @@ export function createCrawler(
     // sitemap reported "907 pages rate limited", which is both wasted work and
     // a wildly overstated loss.
     let pagesRateLimitedThisRun = 0;
+    /**
+     * Authoritative root failure for the current crawl (#1822).
+     *
+     * `updateStats` below is a read-modify-write and the worker pool runs
+     * `concurrency` of them at once, so a worker holding a stale read would
+     * write its own `current.rootFailure` back over a failure another worker
+     * had just recorded (the storage layer's merge is a plain spread of the
+     * full stats object, so `undefined` really does erase it). Keeping the
+     * value here and writing THIS on every stats update means a stale read can
+     * never lose it, and the entry-over-sitemap precedence holds regardless of
+     * the order the workers interleave in. Seeded from storage on resume.
+     */
+    let rootFailure: AuditFailureDetail | undefined;
 
     // Breadth-first tracking
     const prefixStats = new Map<string, { crawled: number; queued: number }>();
@@ -390,8 +467,70 @@ export function createCrawler(
         }
       });
 
-    // Shared cache seam (#147): same lookup logic runs local + cloud.
-    const cacheStore = new StorageCacheStore(storage);
+    // Shared cache seam (#147): same lookup logic runs local + cloud. Injectable
+    // since #1899 so a caller whose previous crawl lives somewhere other than
+    // this database can still revalidate against it.
+    const cacheStore = options.cacheStore ?? new StorageCacheStore(storage);
+
+    /**
+     * A host on the crawl's own site that the base should have been pinned to,
+     * or null when `candidateUrl` agrees with the base (squirrelscan/repo#1899).
+     *
+     * The base is decided by one probe of the seed before anything is fetched.
+     * When that probe is refused — a WAF 403 carries no `Location`, so it is
+     * indistinguishable from an apex that serves the site — the base stays on
+     * the seed's host while the site lives on another. The seed page's own fetch
+     * is the first evidence that contradicts it, and it arrives too late to move
+     * the base: every root probe has already run against the wrong origin.
+     *
+     * A DIFFERENT SITE is not this. That is the #1418 case, refused deliberately
+     * by `resolveSeedRedirect` and already logged where it happens; repeating it
+     * here would turn a security decision into a bug report.
+     */
+    const sameSiteHostOtherThanBase = (candidateUrl: string): string | null => {
+      let host: string;
+      let baseHost: string;
+      try {
+        host = new URL(candidateUrl).host.toLowerCase();
+        baseHost = new URL(baseUrl).host.toLowerCase();
+      } catch {
+        return null;
+      }
+      if (!host || host === baseHost) return null;
+      if (isOffSiteFinalUrl(baseUrl, candidateUrl)) return null;
+      return host;
+    };
+
+    /**
+     * Once per crawl. Three sources of evidence feed this, in descending
+     * strength, and a seed can be re-processed; reporting each would turn one
+     * finding into a stream of them and make the count meaningless.
+     */
+    let seedBaseMismatchReported = false;
+
+    const reportSeedBaseMismatch = (
+      host: string,
+      evidence: string,
+    ): Effect.Effect<void, never, never> =>
+      Effect.gen(function* () {
+        if (seedBaseMismatchReported) return;
+        seedBaseMismatchReported = true;
+        // States what was OBSERVED and offers the cause as a possibility. A
+        // mis-pinned base is the likeliest explanation and the one worth acting
+        // on, but an apex can serve content and canonicalize elsewhere without
+        // ever redirecting, and this cannot tell those apart from here.
+        const message =
+          `the crawl is based on ${new URL(baseUrl).host} but the seed page ${evidence} ` +
+          `${host}. The base is pinned from a probe made before any page was fetched, so if ` +
+          `that probe could not see a redirect, this audit describes the wrong host of the two`;
+        logger.warn("seed base mismatch", message);
+        yield* emit({
+          type: "warning",
+          code: "seed-base-mismatch",
+          message,
+          timestamp: Date.now(),
+        });
+      });
 
     // ----------------------------------------
     // URL Normalization and Scope
@@ -444,9 +583,10 @@ export function createCrawler(
         // Depth ceiling (#318): never enqueue past maxDepth. Unset = unlimited (no-op).
         if (config.maxDepth != null && depth > config.maxDepth) return;
 
-        // Check if already in frontier
-        const existing = yield* storage.getFrontierEntry(crawlId, normalized);
-        if (existing) return;
+        // Check if already in frontier. Existence only: this runs once per
+        // discovered link, so it must not read or materialise the whole row.
+        const alreadyQueued = yield* storage.hasFrontierEntry(crawlId, normalized);
+        if (alreadyQueued) return;
 
         // Oversize URLs (#1229): the publish schema caps pages[].url et al at
         // REPORT_LIMITS.maxUrlLength STRICT (no clamp — they're join keys the
@@ -493,6 +633,18 @@ export function createCrawler(
         // Check robots
         if (config.respectRobots && robots && !robots.isAllowed(normalized)) {
           logger.debug("url skipped (robots)", normalized);
+          // #1822: a disallowed SEED is the whole audit, not one skipped URL —
+          // the crawl then ends with zero pages and no fetch ever failed, so
+          // this is the only place the cause is knowable.
+          if (source === "seed") {
+            yield* updateStats(crawlId, {
+              rootFailure: auditFailureDetail({
+                code: "robots",
+                host: failureHostOf(normalized),
+                source: "entry",
+              }),
+            });
+          }
           yield* storage.upsertFrontier(crawlId, {
             normalizedUrl: normalized,
             rawUrl,
@@ -1011,6 +1163,10 @@ export function createCrawler(
             yield* updateStats(crawlId, {
               pagesFailed: 1,
               ...(blockedFetch ? { pagesBlocked: 1 } : {}),
+              // #1822: the fetcher knows WHY (DNS, TLS, socket, timeout, 5xx).
+              // Without this the reason is discarded here and a zero-page audit
+              // can only say "No pages were crawled".
+              rootFailure: crawlErrorToFailureDetail(error, failureSourceFor(entry.source)),
             });
             markPrefixFailed(entry.normalizedUrl, entry.depth);
             return;
@@ -1043,7 +1199,18 @@ export function createCrawler(
               depth: entry.depth,
               timestamp: Date.now(),
             });
-            yield* updateStats(crawlId, { pagesFailed: 1 });
+            yield* updateStats(crawlId, {
+              pagesFailed: 1,
+              // #1822: only the redirect TARGET'S HOST goes in the reason. The
+              // full URL is site-chosen and ends up quoted in an email and a
+              // markdown report; a hostname cannot smuggle a path or query.
+              rootFailure: auditFailureDetail({
+                code: "redirect",
+                host: failureHostOf(entry.normalizedUrl),
+                detail: `redirected off-site to ${urlHostKey(result.finalUrl)}`,
+                source: failureSourceFor(entry.source),
+              }),
+            });
             markPrefixFailed(entry.normalizedUrl, entry.depth);
             return;
           }
@@ -1146,7 +1313,19 @@ export function createCrawler(
               depth: entry.depth,
               timestamp: Date.now(),
             });
-            yield* updateStats(crawlId, { pagesFailed: 1 });
+            yield* updateStats(crawlId, {
+              pagesFailed: 1,
+              // #1822: a 4xx (and, from a custom fetcher, a 5xx) comes back as a
+              // RESULT and is stored as a page, so it never reaches the fetch
+              // error path above. Recorded here so a site whose entry URL only
+              // ever 404s says so instead of "no pages could be fetched".
+              rootFailure: auditFailureDetail({
+                code: result.status >= 500 ? "http_5xx" : "http_4xx",
+                status: result.status,
+                host: failureHostOf(entry.normalizedUrl),
+                source: failureSourceFor(entry.source),
+              }),
+            });
             markPrefixFailed(entry.normalizedUrl, entry.depth);
             return;
           }
@@ -1222,6 +1401,25 @@ export function createCrawler(
             xRobotsTag: result.securityHeaders.xRobotsTag ?? null,
           };
 
+          // The second detector for a mis-pinned base (#1899). The seed page is
+          // the first thing the crawl fetches with its own agent, its own
+          // headers and its retry stack, so it gets through where the bare
+          // preamble probe did not — and where it LANDS is evidence the probe
+          // never had. Strongest of the three signals, and the only one that
+          // does not need the body, so it sits outside the HTML branch: a seed
+          // serving a PDF still proves which host the site is on.
+          //
+          // This does not move the base and must not: the root probes are
+          // already done against it, and re-basing mid-crawl would file one
+          // origin's content under another's name. It reports, and the apex/www
+          // scope rule keeps the crawl whole meanwhile. So it fires on a crawl
+          // that then succeeds, deliberately — that the audit describes a host
+          // the site redirects away from is worth knowing either way.
+          if (entry.source === "seed") {
+            const landedHost = sameSiteHostOtherThanBase(result.finalUrl);
+            if (landedHost) yield* reportSeedBaseMismatch(landedHost, "landed on");
+          }
+
           // Parse and discover URLs if HTML (before storing page)
           let parsedData: string | null = null;
           if (
@@ -1240,6 +1438,82 @@ export function createCrawler(
               options.parsedPageCache.size < PARSED_PAGE_CACHE_MAX_PAGES
             ) {
               options.parsedPageCache.set(entry.normalizedUrl, parsed);
+            }
+
+            // The second detector for a mis-pinned base (#1899). The seed page
+            // is the first thing the crawl fetches with its own agent, its own
+            // headers and its retry stack, so it gets through where the bare
+            // preamble probe did not — and where it LANDS, plus the canonical it
+            // declares, is evidence the probe never had.
+            //
+            // This does not move the base and must not: the root probes are
+            // already done against it, and re-basing mid-crawl would file one
+            // origin's content under another's name. It reports, and the
+            // apex/www scope rule keeps the crawl whole meanwhile. So it fires
+            // on a crawl that then succeeds, deliberately — the point is that
+            // the audit describes a host the site redirects away from, which is
+            // worth knowing whether or not the pages were reached.
+            // Second-strongest evidence: the host the seed page itself says it
+            // is. Gated on a successful response — an error page's canonical
+            // describes the error template, not the site.
+            if (entry.source === "seed" && result.status >= 200 && result.status < 300) {
+              // Resolved against the page, since a canonical may be relative.
+              let canonicalHost: string | null = null;
+              if (parsed.meta.canonical) {
+                try {
+                  canonicalHost = sameSiteHostOtherThanBase(
+                    new URL(parsed.meta.canonical, result.finalUrl).href,
+                  );
+                } catch {
+                  canonicalHost = null;
+                }
+              }
+              if (canonicalHost) {
+                yield* reportSeedBaseMismatch(canonicalHost, "declares a canonical on");
+              }
+
+              // Weakest evidence, and so the strictest test: a seed page that
+              // links to its own site but NEVER to the base host is the shape of
+              // the collapse. One stray same-site link proves nothing, so a
+              // single link back to the base is enough to stay silent.
+              //
+              // Read off `parsed.links`, not the crawlable set: that set is
+              // already filtered to the PAGE's own hostname, so on exactly the
+              // origin this is trying to describe — an apex serving the site
+              // while every link points at www — it is empty.
+              //
+              // `parsed.links` has already dropped `#`-only anchors and
+              // mailto:/tel: (`shouldSkipUrl`), so an in-page skip link cannot
+              // resolve onto the base host and veto this. Off-site links are
+              // ignored rather than counted either way: `elsewhere` only takes a
+              // SAME-SITE host, so a page linking to www plus a dozen other
+              // domains still reports, and reports the same-site host.
+              const baseHost = new URL(baseUrl).host.toLowerCase();
+              let elsewhere: string | null = null;
+              let onBase = false;
+              for (const link of parsed.links) {
+                let host: string;
+                try {
+                  host = new URL(link.url, result.finalUrl).host.toLowerCase();
+                } catch {
+                  continue;
+                }
+                if (host === baseHost) {
+                  onBase = true;
+                  break;
+                }
+                elsewhere ??= sameSiteHostOtherThanBase(new URL(link.url, result.finalUrl).href);
+              }
+              if (!onBase && elsewhere) {
+                // Not "links only to X": the page may link to several same-site
+                // hosts, and to any number of other sites. What was actually
+                // observed is that nothing points back at the base, and `elsewhere`
+                // is the first same-site host that does not.
+                yield* reportSeedBaseMismatch(
+                  elsewhere,
+                  "links to its own site without ever linking back to the base, for example at",
+                );
+              }
             }
 
             // Reuse document for URL extraction (no second parse)
@@ -1337,6 +1611,13 @@ export function createCrawler(
         const current = yield* storage.getStats(crawlId);
         if (!current) return;
 
+        // Fold before the write so every concurrent updateStats carries the
+        // newest failure, not the one its own (possibly stale) read saw.
+        rootFailure = preferRootFailure(
+          preferRootFailure(rootFailure, current.rootFailure),
+          updates.rootFailure,
+        );
+
         const newStats: CrawlStats = {
           ...current,
           pagesTotal:
@@ -1358,6 +1639,10 @@ export function createCrawler(
             updates.cacheHitsByReason,
           ),
           bytesTotal: current.bytesTotal + (updates.bytesTotal ?? 0),
+          // #1822: not a counter. The in-memory value is the authority (see its
+          // declaration); `current` only contributes on the first update after a
+          // resume, and `updates` can only displace a weaker source.
+          rootFailure,
         };
 
         // Update average load time
@@ -1409,6 +1694,9 @@ export function createCrawler(
         // forgetting that lets the resumed run dispatch them all over again.
         const priorStats = yield* storage.getStats(crawlId).pipe(Effect.orElseSucceed(() => null));
         pagesRateLimitedThisRun = priorStats?.pagesRateLimited ?? 0;
+        // Resume-safe for the same reason (#1822): a crawl continuing from
+        // persisted stats keeps whatever root failure the earlier pass recorded.
+        rootFailure = priorStats?.rootFailure;
         // Throttle verdicts do not survive a run. Exhaustion is terminal WITHIN
         // a run (an exhausted host is skipped before any request, so it can never
         // earn the successes that recover it), and carrying it forward would make
@@ -1569,6 +1857,19 @@ export function createCrawler(
                   ),
                   Effect.catchAll(() => Effect.void),
                 );
+                // #1822: a wedged entry fetch dies HERE, not in processUrl's
+                // fetch-error path, so without this an audit whose root simply
+                // never answered fell back to the generic reason instead of
+                // saying it timed out. Stats only, and only the failure class:
+                // the counters stay with the paths that own them.
+                yield* updateStats(crawlId, {
+                  rootFailure: auditFailureDetail({
+                    code: "timeout",
+                    host: failureHostOf(entry.normalizedUrl),
+                    detail: `no response within ${urlTimeoutMs}ms`,
+                    source: failureSourceFor(entry.source),
+                  }),
+                }).pipe(Effect.catchAll(() => Effect.void));
               }),
             ),
             Effect.catchAll((error) => {
@@ -1773,7 +2074,30 @@ export function createCrawler(
             const hopUrl = currentUrl;
             const redirectTo = await withRequestDeadline(
               Math.min(hopTimeoutMs, remainingMs),
-              (signal) => fetch(hopUrl, { method: "GET", signal, redirect: "follow" }),
+              (signal) =>
+                fetch(hopUrl, {
+                  method: "GET",
+                  signal,
+                  redirect: "follow",
+                  // Identify as the crawl does (squirrelscan/repo#1899). This was
+                  // the only request in the whole crawl going out under the
+                  // runtime's default agent, and origins behind a WAF refuse
+                  // that agent — with a 403 that carries no `Location`, which
+                  // this loop then reads as "the seed does not redirect". The
+                  // base gets pinned to the seed, every `www.` link goes
+                  // cross_domain, and the audit is one page.
+                  //
+                  // The crawl's own `config.headers` deliberately do NOT ride
+                  // along: `redirect: "follow"` hands them to whatever origin
+                  // the chain lands on, and a custom header may be a credential
+                  // (#1395). The agent is not a secret; the rest are.
+                  //
+                  // Only when there is one to send. A header object built from
+                  // an absent value does not omit the header, it sends the
+                  // string "undefined", and an empty one asks the origin to
+                  // treat the request as agentless — the very thing being fixed.
+                  ...(config.userAgent ? { headers: { "User-Agent": config.userAgent } } : {}),
+                }),
               // The deadline stays armed for the whole callback, so the body
               // read below is bounded too — before #1699 the timer was cleared
               // as soon as the headers landed and a stalled body hung here
@@ -1785,6 +2109,25 @@ export function createCrawler(
                 // runtimes and mocks that leave it empty.
                 const served = response.url || hopUrl;
                 settledUrl = served;
+
+                // A refusal is not an answer (squirrelscan/repo#1899). A 403 or
+                // 429 carries no `Location`, so the loop below reads it as "this
+                // URL does not redirect" and the crawl's base is pinned here.
+                // The value is the same either way — there is no second URL to
+                // fall back to — so this says so out loud rather than changing
+                // it: an audit that turns out to be about the wrong half of an
+                // apex/www pair has one line naming the reason. `isInScope`'s
+                // apex/www rule is the recovery; this is the diagnosis.
+                //
+                // 4xx/5xx only. `response.ok` is also false for a 3xx that
+                // `redirect: "follow"` declined to follow (a `Location`-less
+                // 302), which is a different thing from an origin refusing us.
+                if (response.status >= 400 && served === hopUrl) {
+                  logger.warn(
+                    "seed redirect probe refused",
+                    `${hopUrl} answered ${response.status}; the crawl base stays pinned to it`,
+                  );
+                }
 
                 // Check if HTTP redirect occurred
                 if (served !== hopUrl) {
@@ -1890,6 +2233,10 @@ export function createCrawler(
         // Reset breadth-first state for new crawl
         prefixStats.clear();
         pendingDepth1Count = 0;
+
+        // A crawler instance can start more than one crawl, and the base moves
+        // with each; the previous crawl's report must not silence this one.
+        seedBaseMismatchReported = false;
 
         // Reset pattern stats for new crawl
         clearPatternStats(patternStats);
@@ -2347,6 +2694,9 @@ export function createCrawler(
         currentCrawlId = crawlId;
         isRunning = true;
         isPaused = false;
+        // A restart re-crawls from an empty frontier, so it is a fresh run for
+        // reporting purposes and must be able to say this again (#1899).
+        seedBaseMismatchReported = false;
 
         // Merge new config with existing
         const mergedConfig = { ...crawl.config, ...newConfig };

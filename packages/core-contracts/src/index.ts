@@ -28,6 +28,10 @@ export * from "./threat-intel";
 // #1185: unsampled publish resolution signal (type + hash).
 export * from "./resolution";
 
+// #1822: failure classification for a zero-page audit (codes, reason text,
+// next steps) — shared by the crawler, the engine, the renderers and the cloud.
+export * from "./failure-reason";
+
 // Import storage types needed locally by interfaces in this file
 import type {
   AgentAccessProbe,
@@ -40,6 +44,7 @@ import type {
 } from "./storage";
 import type { SiteMetadata } from "./site-metadata";
 import type { ResolutionSignal } from "./resolution";
+import type { AuditFailureReasonCode } from "./failure-reason";
 
 export interface CheckItem {
   id: string;
@@ -277,6 +282,14 @@ export interface AuditReport {
     /** Host(s) that throttled the crawl. */
     hosts: string[];
   };
+  /**
+   * Machine-readable class of the failure behind `statusReason` (#1822), so the
+   * email template, the dashboard, the MCP tools and Sentry can branch on the
+   * cause instead of substring-matching prose. Set alongside `statusReason`;
+   * absent on reports stored before #1822, where
+   * `classifyAuditFailureReasonText` recovers the class from the text.
+   */
+  statusReasonCode?: AuditFailureReasonCode;
   healthScore?: HealthScore;
   ruleResults: Record<string, ReportRuleResult>;
   /**
@@ -440,6 +453,13 @@ export interface ScanScope {
   origin: "cli" | "ci" | "cloud";
   /** Page cap in effect for this run; absent when the runner had no cap. */
   maxPages?: number;
+  /**
+   * What the run ASKED for, present only when that exceeded the ceiling and was
+   * clamped down to `maxPages` (#1909). Absent on every ordinary run, so a
+   * caller detects a clamp by its presence rather than by comparing to a cap it
+   * would have to know.
+   */
+  requestedMaxPages?: number;
   /** Pages freshly crawled this run (the report.pages basis, before publish drops pages[]). */
   pagesCrawled: number;
   /** The page cap was the binding constraint — the site likely has more pages. */
@@ -736,7 +756,36 @@ export type CrawlerEvent =
       durationMs: number;
       timestamp: number;
     }
+  | {
+      /**
+       * The crawl found something a human should see and carried on anyway.
+       * Non-fatal by construction — `error` is the other case — so a consumer
+       * that ignores this type loses information but never correctness.
+       *
+       * Added for squirrelscan/repo#1899, where a crawl audited the wrong half
+       * of an apex/www pair and said nothing: `logger.warn` reaches a terminal
+       * or a container's stdout, neither of which is where a hosted run is
+       * investigated weeks later. This rides the event stream the run already
+       * records.
+       */
+      type: "warning";
+      code: CrawlWarningCode;
+      message: string;
+      timestamp: number;
+    }
   | { type: "error"; error: string; fatal: boolean; timestamp: number };
+
+/**
+ * Stable keys for {@link CrawlerEvent} warnings, so a consumer can branch or
+ * aggregate without parsing the prose in `message`.
+ *
+ * `seed-base-mismatch`: the crawl's base origin disagrees with where the seed
+ * page itself landed, or with the canonical the seed page declares, on the same
+ * site. The base is pinned from one probe before anything is fetched; when that
+ * probe cannot see an apex→www redirect the whole audit describes the wrong
+ * host. The page fetch is the first evidence that contradicts it.
+ */
+export type CrawlWarningCode = "seed-base-mismatch";
 
 export interface AuditLifecycleEvent {
   type:
@@ -1459,14 +1508,18 @@ export interface PlanDefinition {
    */
   scheduleFrequencies?: readonly ScheduledAuditFrequency[];
   /**
-   * Raw per-plan cloud-audit page ceiling (#1020 ladder: Free 500 / Pro
-   * 2,000 / Team 5,000). This is the plan's OWN allowance, not the effective
-   * runtime ceiling — hosted dispatch sites clamp it further to
-   * `REPORT_LIMITS.maxPages`, the report/publish ingest cap. Team's raw value
-   * exceeds that cap today on purpose: raising the cap later (separate
-   * engine/report-pipeline work) auto-unlocks Team with no plan-data change.
-   * Local CLI audits are UNAFFECTED — they use their own generous
-   * MAX_PAGES_CAP regardless of plan.
+   * Raw per-plan cloud-audit page ceiling (#1028 ladder: Free 500 / Pro 2,000 /
+   * Team 10,000 / Enterprise 10,000). This is the plan's OWN allowance, not the
+   * effective runtime ceiling — hosted dispatch sites clamp it further to
+   * `REPORT_LIMITS.maxPages`, the report/publish ingest cap. Every ladder value
+   * is at or under that cap today, so nothing is silently clamped; the
+   * `Math.min` in `planMaxPages()` stays as the backstop for the case where the
+   * ingest cap is lowered without the ladder following.
+   *
+   * The ladder is bounded by container MEMORY, not by pricing: a 10,000-page
+   * audit retains ~4.4 GB, which fits the paid standard-4 class (#1869) and not
+   * free's 4 GiB. Local CLI audits are UNAFFECTED — they use MAX_PAGES_CAP
+   * regardless of plan.
    */
   maxPagesPerAudit: number;
   /**
