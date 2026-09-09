@@ -67,6 +67,7 @@
               "projects",
               "crawl",
               "reports",
+              "guides/failed-audits",
               "guides/badges",
               "guides/browser-rendering",
               "guides/rate-limited-hosts",
@@ -242,13 +243,16 @@
                   "rules/content/author-info",
                   "rules/content/meta-in-body",
                   "rules/content/mime-type",
+                  "rules/content/placeholder-text",
                   "rules/content/article-links",
                   "rules/content/quality",
                   "rules/content/stale-copyright",
                   "rules/content/mojibake",
                   "rules/content/thin-vs-site-norm",
                   "rules/content/title-pattern-outlier",
-                  "rules/content/date-agreement"
+                  "rules/content/date-agreement",
+                  "rules/content/unrendered-markup",
+                  "rules/content/dev-leakage"
                 ]
               },
               {
@@ -624,6 +628,7 @@
               "configuration/rules",
               "configuration/external-links",
               "configuration/output",
+              "configuration/storage",
               "configuration/cloud",
               "configuration/rule-options",
               "configuration/examples"

@@ -81,6 +81,16 @@ describe("Content Store", () => {
       expect(retrieved).toBe(js);
     });
 
+    test("should store content under an explicit cache key", () => {
+      const url = "https://cdn.example.com/script.js";
+      const js = 'console.log("cached by URL");';
+      const hash = store.putForKey(url, js, "application/javascript");
+
+      expect(hash).toBe(hashContent(url));
+      expect(store.getString(hash)).toBe(js);
+      expect(store.getString(hashContent(js))).toBeNull();
+    });
+
     test("should return null for non-existent hash", () => {
       const result = store.get("nonexistent-hash");
       expect(result).toBeNull();
@@ -178,6 +188,30 @@ describe("Content Store", () => {
   });
 
   describe("getStats", () => {
+    // getStats() runs on every put() that stores new content (the prune check).
+    // Without a covering index SQLite scans the table and pages in every
+    // gzipped BLOB just to sum their sizes, which on a filled ~1GB store cost
+    // ~300ms per stored page and dominated a cold audit.
+    test("should answer the aggregate query from a covering index", () => {
+      store.put("some content to make the table non-empty", "text/html");
+
+      const db = (
+        store as unknown as { getDb: () => import("bun:sqlite").Database }
+      ).getDb();
+      const plan = db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT COUNT(*) as count, SUM(compressed_size) as total_compressed,
+                  SUM(original_size) as total_original, MIN(last_accessed) as oldest
+           FROM content`
+        )
+        .all() as Array<{ detail: string }>;
+
+      const detail = plan.map((row) => row.detail).join(" | ");
+      expect(detail).toContain("COVERING INDEX");
+      expect(detail).toContain("idx_content_sizes");
+    });
+
     test("should return empty stats for new store", () => {
       const stats = store.getStats();
 

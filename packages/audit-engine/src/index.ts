@@ -17,14 +17,27 @@ export {
   isRenderedFetch,
   renderedPageUrlsFrom,
   setAdapterLogger,
+  // Pre-rules collection seams (#1860) — the DOM-needing halves of the asset and
+  // external-link phases, split so they can be fed one page batch at a time.
+  absorbExternalLinkOccurrences,
+  checkCollectedExternalLinks,
+  createSiteAssetCollector,
+  fetchAssetsFromOccurrences,
+  V1_REPORT_PAGE_BATCH,
 } from "./adapter";
 export type {
   SiteContextPage,
   RuleExecutionResult,
   StreamingRuleExecutionResult,
+  // #1860: the sub-phase names, so a consumer can map them exhaustively rather
+  // than reconstructing the strings and casting.
+  StreamingRulePhase,
   PreFetchedAssets,
   ResourceCheckOverrides,
   ExternalLinkCheckProgress,
+  ExternalLinkOccurrences,
+  SiteAssetOccurrences,
+  BuildV1ReportOptions,
   FullAuditReport,
   PageAudit,
   AuditSummary,
@@ -46,6 +59,7 @@ export {
   addTally,
   emptyTally,
   ruleScoreFromTally,
+  carriedFindingToCheck,
 } from "./scoring";
 export type { AuditStatusSignals } from "./scoring";
 export type {
@@ -82,8 +96,12 @@ export type {
   CloudSmartAuditsInput,
   CloudSmartAuditsResult,
 } from "./merge-promise";
-export { reconstructCompleteResults } from "./reconstruct";
+export { reconstructCompleteResults, reconstructPageRuleChecks } from "./reconstruct";
 export type { ReconstructCompleteInput } from "./reconstruct";
+// Bounded complete-store scoring fold (#1873) — the memory-safe twin of
+// reconstructCompleteResults + buildScoringResultsFromMerged.
+export { foldCompleteStoreTallies } from "./complete-store-fold";
+export type { CompleteStoreTallyInput, FindingPageSource } from "./complete-store-fold";
 // Chunked-publish producer: flatten a report to complete streamable findings (#1023).
 export { buildStreamFindings, buildSkippedPassCounts } from "./stream-findings";
 export type { StreamFindingLine, SkippedPassCounts } from "./stream-findings";
@@ -105,6 +123,7 @@ export * from "./runner";
 export {
   localIntelContext,
   buildFullIntelContext,
+  buildFullIntelContextFromUrls,
   mapIntelConfig,
   collectIntelUrls,
 } from "./intel";
@@ -175,6 +194,45 @@ export { createSiteQuery } from "./site-query";
 export { extractPageFeatures, isAuditablePage } from "./page-features";
 export { isHtmlContentType } from "./adapter";
 
+// Template cluster key (#1949) — the equality reduction of `fingerprintPage`
+// stored on page_features.template_fp and grouped by SiteQuery.templateClusters().
+export { templateFingerprintKey, templateVerdictKey } from "./template-key";
+
+// Template fan-out (#1951) — run a rule declaring verdictScope "template" once
+// per cluster and give its verdict to the members. The kill switch is
+// SQUIRREL_TEMPLATE_FANOUT=0; `templateFanoutEnabled` is what reads it.
+export {
+  createTemplateFanout,
+  fanoutClusterKey,
+  templateFanoutEnabled,
+  DEFAULT_MAX_CLUSTERS,
+} from "./template-fanout";
+export type { TemplateFanout, TemplateFanoutStats } from "./template-fanout";
+
 // Streaming rules engine (#1021, PR-E) — batched page-rule pass with DOM-drop.
 export { streamPageRules, STREAM_PAGE_BATCH } from "./streaming";
-export type { PageSignalCollector, StreamPageRulesHooks, StreamPageRulesResult } from "./streaming";
+export type {
+  PageSignalCollector,
+  SharedPageSignals,
+  StreamPageRulesHooks,
+  StreamPageRulesResult,
+} from "./streaming";
+
+// Streamed pre-rules phase (#1860) — one batched walk that feeds the asset,
+// external-link, tech-detect, intel and cloud-prefetch collectors together.
+export { runStreamingPreRules, PRE_RULES_PAGE_BATCH } from "./streaming-pre-rules";
+export { detachFromPage, type DetachBoundary } from "./detach";
+export type { StreamPreRulesOptions, StreamPreRulesResult } from "./streaming-pre-rules";
+
+// Byte-budget batch sizing (#1860) — pages per batch derived from the site's own
+// average page size, because peak RSS is batch x per-page cost and per-page cost
+// is a property of the site, not of us.
+export {
+  resolveStreamBatch,
+  resolveStreamBatchPages,
+  sampleAveragePageBytes,
+  STREAM_BATCH_BYTES,
+  STREAM_BATCH_MIN_PAGES,
+  STREAM_BATCH_MAX_PAGES,
+} from "./batch-sizing";
+export type { ResolvedStreamBatch } from "./batch-sizing";

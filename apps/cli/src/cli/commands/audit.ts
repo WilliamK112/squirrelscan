@@ -37,6 +37,7 @@ import {
   generateXmlReport,
   generateLlmReport,
 } from "@/audit/report";
+import { formatRetentionNotice } from "@/audit/retention";
 import {
   filterResolvesToZeroCategories,
   isCategoryExcluded,
@@ -60,6 +61,7 @@ import {
   type ReportVisibility,
 } from "@/controllers/report/publish";
 import { formatBalance, isUnlimitedBalance } from "@/lib/balance";
+import { pageLimitNotice, resolvePageLimit } from "@/lib/page-limit";
 import {
   createRunFinalizer,
   type FinalizeRunInput,
@@ -1124,7 +1126,14 @@ export const audit = defineCommand({
         process.exitCode = 1;
         return;
       }
-      const maxPages = Math.min(requestedMaxPages, MAX_PAGES_CAP);
+      // Clamp and SAY SO (#1909). Silently applying the cap made a request for
+      // 10,000 pages indistinguishable from a 5,000-page site, and the existing
+      // notice in cli/format.ts only fires when a crawl reaches the cap — so a
+      // 10,000-page request against a 4,000-page site was never mentioned.
+      const pageLimit = resolvePageLimit(requestedMaxPages);
+      const maxPages = pageLimit.effective;
+      const clampNotice = pageLimitNotice(pageLimit);
+      if (clampNotice) console.error(fmt.yellow(clampNotice));
 
       // CLI --max-depth > config crawler.max_depth > unset (unlimited).
       let maxDepth: number | undefined;
@@ -1181,6 +1190,10 @@ export const audit = defineCommand({
       const options: AuditOptions = {
         url: args.url,
         maxPages,
+        // Carried so the report can record the clamp; the controller stamps it.
+        ...(pageLimit.clamped
+          ? { requestedMaxPages: pageLimit.requested }
+          : {}),
         maxDepth,
         outputFormat: args.format as
           | "console"
@@ -1585,6 +1598,12 @@ export const audit = defineCommand({
           // Render strategy when rendering is on: auto = HTTP-first hybrid,
           // all = render every page. Undefined → controller's coverage default.
           renderStrategy,
+          // Retention (#1912) deleted some of this project's audit history, so
+          // say so. stderr unconditionally: this is the one line that tells a
+          // user their older reports are gone, and putting it on stdout would
+          // corrupt `-f json` for the scripts that parse it.
+          onRetention: (outcome) =>
+            console.error(formatRetentionNotice(outcome)),
           configPath: getGlobalConfigPath(),
           onEvent: (event: CrawlerEvent) => {
             switch (event.type) {

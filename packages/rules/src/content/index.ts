@@ -6,6 +6,7 @@ import { articleLinksRule } from "./article-links";
 import { authorInfoRule } from "./author-info";
 import { brokenHtmlRule } from "./broken-html";
 import { dateAgreementRule } from "./date-agreement";
+import { devLeakageRule } from "./dev-leakage";
 import { duplicateDescriptionRule } from "./duplicate-description";
 import { duplicateTitleRule } from "./duplicate-title";
 import { freshnessRule } from "./freshness";
@@ -15,11 +16,13 @@ import { keywordStuffingRule } from "./keyword-stuffing";
 import { metaInBodyRule } from "./meta-in-body";
 import { mojibakeRule } from "./mojibake";
 import { mimeTypeRule } from "./mime-type";
+import { placeholderTextRule } from "./placeholder-text";
 import { contentQualityRule } from "./quality";
 import { readingLevelRule } from "./reading-level";
 import { staleCopyrightRule } from "./stale-copyright";
 import { thinVsSiteNormRule } from "./thin-vs-site-norm";
 import { titlePatternOutlierRule } from "./title-pattern-outlier";
+import { unrenderedMarkupRule } from "./unrendered-markup";
 import { wordCountRule } from "./word-count";
 
 export const rules: Rule[] = [
@@ -42,6 +45,9 @@ export const rules: Rule[] = [
   thinVsSiteNormRule,
   titlePatternOutlierRule,
   dateAgreementRule,
+  placeholderTextRule,
+  unrenderedMarkupRule,
+  devLeakageRule,
 ];
 
 export {
@@ -50,6 +56,7 @@ export {
   brokenHtmlRule,
   contentQualityRule,
   dateAgreementRule,
+  devLeakageRule,
   duplicateDescriptionRule,
   duplicateTitleRule,
   freshnessRule,
@@ -59,9 +66,11 @@ export {
   metaInBodyRule,
   mimeTypeRule,
   mojibakeRule,
+  placeholderTextRule,
   readingLevelRule,
   staleCopyrightRule,
   thinVsSiteNormRule,
   titlePatternOutlierRule,
+  unrenderedMarkupRule,
   wordCountRule,
 };

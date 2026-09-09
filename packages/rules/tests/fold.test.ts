@@ -6,7 +6,11 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { CHECK_DETAILS_LIMITS, REPORT_LIMITS } from "@squirrelscan/core-contracts/limits";
+import {
+  CHECK_DETAILS_LIMITS,
+  MAX_PAGES_CAP,
+  REPORT_LIMITS,
+} from "@squirrelscan/core-contracts/limits";
 
 import { clampItemId } from "@squirrelscan/core-contracts/clamp";
 
@@ -181,6 +185,40 @@ describe("foldOverflowChecks", () => {
     );
     expect(foldOverflowChecks(checks, SMALL)).toHaveLength(SMALL.maxChecks);
   });
+
+  test("re-folding an aggregate keeps its TRUE occurrence total, not the object count (#1873)", () => {
+    // The complete-store finalize appends carried per-page checks to the staged
+    // shell's already-folded aggregates and re-folds. Counting objects would tell
+    // issue-sync this rule had 7 occurrences when the aggregate alone stands for
+    // 600 — and `occurrences` IS the tracker's count.
+    const aggregate = failCheck({
+      message: "1 thing broken (+599 more pages)",
+      pages: Array.from({ length: 3 }, (_, i) => `https://example.com/old/${i}`),
+      details: { aggregated: true, occurrences: 600, pagesTruncated: 600 },
+    });
+    const carried = Array.from({ length: 6 }, (_, i) =>
+      failCheck({ pageUrl: `https://example.com/new/${i}` }),
+    );
+
+    const folded = foldOverflowChecks([aggregate, ...carried], SMALL);
+    expect(folded).toHaveLength(1);
+    expect(folded[0]!.details?.occurrences).toBe(606); // 600 + 6, not 7
+    // The affected-page floor still comes from the constituent's marker.
+    expect(folded[0]!.details?.pagesTruncated).toBe(600);
+  });
+
+  test("unfold then re-fold still counts one occurrence per page (#1873)", () => {
+    // unfoldAggregateCheck deletes `occurrences` precisely so the expanded checks
+    // count as one each; this pins that the sum above cannot double-count them.
+    const aggregate = failCheck({
+      message: "1 thing broken (+5 more pages)",
+      pages: Array.from({ length: 6 }, (_, i) => `https://example.com/p/${i}`),
+      details: { aggregated: true, occurrences: 6 },
+    });
+    const refolded = foldOverflowChecks(unfoldAggregateCheck(aggregate), SMALL);
+    expect(refolded).toHaveLength(1);
+    expect(refolded[0]!.details?.occurrences).toBe(6);
+  });
 });
 
 // #910 acceptance: the exact drmadnani.com failure mode — images/alt-text
@@ -349,10 +387,15 @@ describe("unfoldAggregateCheck", () => {
 });
 
 describe("per-check pages cap (#918)", () => {
-  test("DEFAULT_FOLD_LIMITS.maxPagesPerCheck tracks REPORT_LIMITS, above the crawl ceiling", () => {
+  test("DEFAULT_FOLD_LIMITS.maxPagesPerCheck tracks REPORT_LIMITS and covers a full crawl", () => {
     expect(DEFAULT_FOLD_LIMITS.maxPagesPerCheck).toBe(REPORT_LIMITS.maxPagesPerCheck);
-    // Decoupled from + larger than the crawl-ceiling maxPages (#918).
-    expect(REPORT_LIMITS.maxPagesPerCheck).toBeGreaterThan(REPORT_LIMITS.maxPages);
+    // The point of #918's decoupling: a folded check can list every page of the
+    // largest crawl either surface can dispatch, so nothing is silently clipped.
+    // Asserted against BOTH ceilings rather than "strictly above maxPages" — the
+    // strict form only held while the cloud ceiling sat below the CLI's, and
+    // #1028 raised both to MAX_PAGES_CAP.
+    expect(REPORT_LIMITS.maxPagesPerCheck).toBe(MAX_PAGES_CAP);
+    expect(REPORT_LIMITS.maxPagesPerCheck).toBeGreaterThanOrEqual(REPORT_LIMITS.maxPages);
   });
 
   test("a >2000-page failure keeps every page (no clip at the old 2000 cap)", () => {

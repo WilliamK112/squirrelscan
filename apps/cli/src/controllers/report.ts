@@ -10,6 +10,7 @@ import type {
   PublishedReportRecord,
 } from "@/crawler/storage/types";
 import type {
+  AuditFailureReasonCode,
   AuditReport,
   AuditStatus,
   CheckResult,
@@ -31,6 +32,7 @@ import {
 import { getGlobalContentStore } from "@/crawler/storage/content-store";
 import { SQLiteStorage } from "@/crawler/storage/sqlite";
 import { reconstructReport } from "@/reports/reconstruct";
+import { retiredAuditReason } from "@/reports/retired";
 import { isValidCategory, normalizeCategoryCode } from "@/rules/categories";
 import { getProjectsPath } from "@/self/paths";
 import {
@@ -46,6 +48,32 @@ const REPORT_READY_STATUSES = new Set<CrawlStatus>(["analyzed", "completed"]);
 
 export function isReportReadyStatus(status: CrawlStatus): boolean {
   return REPORT_READY_STATUSES.has(status);
+}
+
+/**
+ * Whether this audit can still be rendered (#1912).
+ *
+ * Takes the CRAWL rather than its status on purpose. `self disk --prune`
+ * reclaims an audit's derived rows and leaves the crawl row saying `completed`,
+ * so a status-only check reads a retired audit as renderable and the report path
+ * rebuilds a confident EMPTY report from whatever pages survive. Every gate that
+ * used to test the status now tests this, so a future one cannot quietly miss
+ * the retired case.
+ */
+export function isReportRenderable(crawl: {
+  status: CrawlStatus;
+  retiredAt?: number;
+}): boolean {
+  return isReportReadyStatus(crawl.status) && crawl.retiredAt === undefined;
+}
+
+/** Why {@link isReportRenderable} said no, in the words the user should see. */
+export function reportUnavailableReason(crawl: {
+  status: CrawlStatus;
+  retiredAt?: number;
+}): string {
+  if (crawl.retiredAt !== undefined) return retiredAuditReason(crawl.retiredAt);
+  return getReportNotReadyReason(crawl.status);
 }
 
 export function getReportNotReadyReason(status: CrawlStatus): string {
@@ -99,10 +127,16 @@ interface SlimJsonReport {
     };
     timestamp: string;
     totalPages: number;
+    /** Page cap in force (#1909); absent in slim JSON written before it. */
+    maxPages?: number;
+    /** Requested cap, present only when it was clamped (#1909). */
+    requestedMaxPages?: number;
   };
   // Audit validity (#801): absent in slim JSON written before #801 ⇒ completed.
   status?: AuditStatus;
   statusReason?: string;
+  /** Machine-readable class behind `statusReason` (#1822); absent pre-#1822. */
+  statusReasonCode?: AuditFailureReasonCode;
   score: {
     overall: number | null; // null ⇒ N/A (failed/0-page audit, #586)
     grade: string;
@@ -218,11 +252,31 @@ function convertSlimReport(report: SlimJsonReport): AuditReport {
       : {}),
     timestamp: report.meta.timestamp,
     totalPages: report.meta.totalPages,
+    // Rebuild the scan scope the slim JSON flattened into `meta` (#1909).
+    // Without this, re-rendering a saved report loses both page limits and a
+    // clamped run reads exactly like an unclamped one — which is the bug this
+    // change exists to fix, reappearing one round trip later.
+    ...(report.meta.maxPages !== undefined
+      ? {
+          scanScope: {
+            origin: "cli" as const,
+            maxPages: report.meta.maxPages,
+            ...(report.meta.requestedMaxPages !== undefined
+              ? { requestedMaxPages: report.meta.requestedMaxPages }
+              : {}),
+            pagesCrawled: report.meta.totalPages,
+            capped: report.meta.totalPages >= report.meta.maxPages,
+          },
+        }
+      : {}),
     passed: report.summary.passed,
     warnings: report.summary.warnings,
     failed: report.summary.failed,
     ...(report.status ? { status: report.status } : {}),
     ...(report.statusReason ? { statusReason: report.statusReason } : {}),
+    ...(report.statusReasonCode
+      ? { statusReasonCode: report.statusReasonCode }
+      : {}),
     siteChecks: [],
     pages: [],
     summary: {
@@ -366,11 +420,11 @@ export async function getStoredAudit(
         continue;
       }
 
-      if (!isReportReadyStatus(crawl.status)) {
+      if (!isReportRenderable(crawl)) {
         return err(
           commandError(
             ErrorCodes.CRAWL_NOT_READY,
-            `Audit ${getReportNotReadyReason(crawl.status)}: ${auditId}`
+            `Audit ${reportUnavailableReason(crawl)}: ${auditId}`
           )
         );
       }
@@ -467,11 +521,11 @@ export async function getStoredAuditByPrefix(
 
   // Exactly one match - reconstruct report
   const match = allMatches[0];
-  if (!isReportReadyStatus(match.crawl.status)) {
+  if (!isReportRenderable(match.crawl)) {
     return err(
       commandError(
         ErrorCodes.CRAWL_NOT_READY,
-        `Audit ${getReportNotReadyReason(match.crawl.status)}: ${match.crawl.id}`
+        `Audit ${reportUnavailableReason(match.crawl)}: ${match.crawl.id}`
       )
     );
   }
@@ -584,9 +638,10 @@ export async function getLatestAudit(
       );
     }
 
-    const reportReady = filtered.filter((c) =>
-      isReportReadyStatus(c.crawl.status)
-    );
+    // A retired audit is not a candidate baseline: --diff and
+    // --regression-since resolve through here, and reclaimed data cannot be
+    // compared against.
+    const reportReady = filtered.filter((c) => isReportRenderable(c.crawl));
     if (reportReady.length === 0) {
       const pending = filtered.find(
         (c) => c.crawl.status === "running" || c.crawl.status === "paused"

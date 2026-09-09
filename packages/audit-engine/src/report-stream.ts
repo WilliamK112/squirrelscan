@@ -308,25 +308,42 @@ export interface FullAuditReport extends AuditReport {
   sitemapUrlStatuses?: SitemapUrlStatusData[];
 }
 
+/** Default page batch for v1's summary + pageAudits pass (#1860). */
+export const V1_REPORT_PAGE_BATCH = 100;
+
+export interface BuildV1ReportOptions {
+  batchSize?: number;
+  /** Fired after each page batch with the running count. The container wires its
+   * liveness heartbeat here so a large-crawl report tail keeps the run alive
+   * (aligns #1252) instead of going silent for the whole assembly. */
+  onBatch?: (info: { pagesDone: number }) => void;
+}
+
 /**
  * Build a FullAuditReport from crawler storage — the v1 (non-streaming) path.
  *
  * Moved verbatim from adapter.generateReportFromStorage (#1021, PR-F); adapter's
  * exported generateReportFromStorage is now a one-line delegate to this. Keeping
  * it byte-identical is the 518-page golden-diff gate.
+ *
+ * #1860: the one whole-crawl `getPages` this used to make is now a batched walk
+ * (see the pass below). Output is unchanged — the batching is a residency fix,
+ * not a report change — and the golden baseline gates that.
  */
 export function buildV1Report(
   storage: CrawlStorage,
   crawlId: string,
   ruleResults: RuleExecutionResult,
+  options?: BuildV1ReportOptions,
 ): Effect.Effect<FullAuditReport, never, never> {
   return Effect.gen(function* () {
     const reportSpan = logger.traceStart("generateReportFromStorage");
+    // Clamped — a 0 batch is an infinite loop (LIMIT 0 is unlimited in SQLite
+    // and the offset never advances). See streaming-pre-rules.ts.
+    const batchSize = Math.max(1, options?.batchSize ?? V1_REPORT_PAGE_BATCH);
     const crawl = yield* storage
       .getCrawl(crawlId)
       .pipe(Effect.catchAll(() => Effect.succeed(null)));
-
-    const pages = yield* storage.getPages(crawlId).pipe(Effect.catchAll(() => Effect.succeed([])));
 
     const links = yield* storage.getLinks(crawlId).pipe(Effect.catchAll(() => Effect.succeed([])));
 
@@ -362,22 +379,6 @@ export function buildV1Report(
       redirectChains: [],
       securityIssues: [],
     };
-
-    // Use cached parsed pages for summary (optimization: no redundant parsing)
-    const summaryParseSpan = logger.traceStart("summary:useCachedParsed");
-    for (const page of pages) {
-      const parsed = ruleResults.parsedPages.get(page.normalizedUrl);
-      if (!parsed) continue;
-
-      if (!parsed.meta.title) summary.missingTitles.push(page.normalizedUrl);
-      if (!parsed.meta.description) summary.missingDescriptions.push(page.normalizedUrl);
-      if (!parsed.og.title && !parsed.og.image) summary.missingOgTags.push(page.normalizedUrl);
-      if (!parsed.twitter.card) summary.missingTwitterCards.push(page.normalizedUrl);
-      if (!parsed.schema.types.length) summary.missingSchemas.push(page.normalizedUrl);
-      if (parsed.h1.count > 1) summary.multipleH1s.push(page.normalizedUrl);
-      if (parsed.content.isThinContent) summary.thinContentPages.push(page.normalizedUrl);
-    }
-    logger.traceEnd(summaryParseSpan, { pageCount: pages.length });
 
     // Check missing alt text (batch query when available)
     const imageAppearancesSpan = logger.traceStart("imageAppearances");
@@ -421,84 +422,124 @@ export function buildV1Report(
       results: ruleResults.ruleResultsMap,
     });
 
-    // Build page audits (optimization: use cached parsed pages)
+    // Build the summary + page audits in ONE batched pass over the crawl's pages
+    // (#1860). Batched rather than one `getPages(crawlId)` because a PageRecord
+    // carries the page's full html: on a 500-page crawl of ~1 MB pages the
+    // resident array alone was ~600 MB, landing on top of the rules phase's peak.
+    // `getPages` orders by normalized_url ASC with or without LIMIT/OFFSET, so
+    // walking it in batches visits exactly the sequence the resident array did —
+    // same summary entries, same pageAudits order, byte-identical report.
     const pageAuditsSpan = logger.traceStart("pageAudits:useCachedParsed");
     const pageAudits: PageAudit[] = [];
-    for (const page of pages) {
-      const parsed = ruleResults.parsedPages.get(page.normalizedUrl) ?? null;
-      const pageChecks = ruleResults.pageResults.get(page.normalizedUrl) ?? [];
+    // Statuses only — all `deriveAuditStatusFromPages` and the rate-limit count
+    // read, and 8 bytes a page instead of a megabyte.
+    const pageStatuses: Array<{ status: number }> = [];
+    let pagesCrawled = 0;
+    for (let offset = 0; ; offset += batchSize) {
+      // Fail-loud, and a deliberate change from the single resident read this
+      // replaced. That read degraded to `[]` on failure, which produced a
+      // `totalPages: 0` report — wrong, but visibly wrong. Degrading a BATCHED
+      // read the same way is worse: it would end the walk at an arbitrary offset
+      // and publish a confident report over a truncated page set. So a mid-walk
+      // read failure now kills the run instead. The cost is that a caller which
+      // used to get a failed-looking report for an unreadable crawl now gets a
+      // rejected promise (matches streamPageRules and site-query.ts).
+      const batch = yield* storage
+        .getPages(crawlId, { limit: batchSize, offset })
+        .pipe(Effect.orDie);
+      if (batch.length === 0) break;
 
-      // Get links for this page using per-page index lookup
-      const pageLinkAppearances = hasSqliteStorage
-        ? yield* (storage as import("@squirrelscan/crawler").SQLiteStorage)
-            .getLinkAppearancesForPage(crawlId, page.normalizedUrl)
-            .pipe(Effect.catchAll(() => Effect.succeed([])))
-        : [];
-      const pageLinks = pageLinkAppearances.map((a) => ({
-        url: a.href,
-        text: a.anchorText,
-        isInternal: linkByHref.get(a.href)?.isInternal ?? false,
-      }));
+      for (const page of batch) {
+        pagesCrawled++;
+        pageStatuses.push({ status: page.status });
+        const parsed = ruleResults.parsedPages.get(page.normalizedUrl) ?? null;
+        const pageChecks = ruleResults.pageResults.get(page.normalizedUrl) ?? [];
 
-      // Get images for this page using per-page index lookup
-      const pageImageAppearances = hasSqliteStorage
-        ? yield* (storage as import("@squirrelscan/crawler").SQLiteStorage)
-            .getImageAppearancesForPage(crawlId, page.normalizedUrl)
-            .pipe(Effect.catchAll(() => Effect.succeed([])))
-        : [];
-      const pageImages = pageImageAppearances.map((a) => ({
-        src: a.src,
-        alt: a.alt ?? null,
-        width: null,
-        height: null,
-      }));
+        if (parsed) {
+          if (!parsed.meta.title) summary.missingTitles.push(page.normalizedUrl);
+          if (!parsed.meta.description) summary.missingDescriptions.push(page.normalizedUrl);
+          if (!parsed.og.title && !parsed.og.image) summary.missingOgTags.push(page.normalizedUrl);
+          if (!parsed.twitter.card) summary.missingTwitterCards.push(page.normalizedUrl);
+          if (!parsed.schema.types.length) summary.missingSchemas.push(page.normalizedUrl);
+          if (parsed.h1.count > 1) summary.multipleH1s.push(page.normalizedUrl);
+          if (parsed.content.isThinContent) summary.thinContentPages.push(page.normalizedUrl);
+        }
 
-      pageAudits.push({
-        url: page.normalizedUrl,
-        statusCode: page.status,
-        loadTime: page.loadTimeMs,
-        meta: parsed?.meta ?? {
-          title: null,
-          description: null,
-          canonical: null,
-          robots: null,
-        },
-        og: parsed?.og ?? {
-          title: null,
-          description: null,
-          url: null,
-          type: null,
-          image: null,
-          siteName: null,
-        },
-        twitter: parsed?.twitter ?? {
-          card: null,
-          title: null,
-          description: null,
-          image: null,
-        },
-        schema: parsed?.schema ?? {
-          types: [],
-          valid: true,
-          errors: [],
-          raw: null,
-        },
-        links: pageLinks,
-        images: pageImages,
-        h1Count: parsed?.h1.count ?? 0,
-        h1Text: parsed?.h1.texts ?? [],
-        // #1003: bound oversize item ids/items-arrays and cap a page's own
-        // checks count at maxChecksPerPage — the cloud path publishes pages[]
-        // unstripped, so an over-cap single page hit the schema's silent
-        // slice. A page's checks mix many DIFFERENT rules, so this must NOT
-        // fold by (name,status) like capChecksForPublish does (see its doc).
-        checks: capMixedRuleChecksForPublish(pageChecks, REPORT_LIMITS.maxChecksPerPage),
-        redirectChain: page.redirectChain,
-        fetcherId: page.fetcherId,
-        fallbackReason: page.fallbackReason,
-      });
+        // Get links for this page using per-page index lookup
+        const pageLinkAppearances = hasSqliteStorage
+          ? yield* (storage as import("@squirrelscan/crawler").SQLiteStorage)
+              .getLinkAppearancesForPage(crawlId, page.normalizedUrl)
+              .pipe(Effect.catchAll(() => Effect.succeed([])))
+          : [];
+        const pageLinks = pageLinkAppearances.map((a) => ({
+          url: a.href,
+          text: a.anchorText,
+          isInternal: linkByHref.get(a.href)?.isInternal ?? false,
+        }));
+
+        // Get images for this page using per-page index lookup
+        const pageImageAppearances = hasSqliteStorage
+          ? yield* (storage as import("@squirrelscan/crawler").SQLiteStorage)
+              .getImageAppearancesForPage(crawlId, page.normalizedUrl)
+              .pipe(Effect.catchAll(() => Effect.succeed([])))
+          : [];
+        const pageImages = pageImageAppearances.map((a) => ({
+          src: a.src,
+          alt: a.alt ?? null,
+          width: null,
+          height: null,
+        }));
+
+        pageAudits.push({
+          url: page.normalizedUrl,
+          statusCode: page.status,
+          loadTime: page.loadTimeMs,
+          meta: parsed?.meta ?? {
+            title: null,
+            description: null,
+            canonical: null,
+            robots: null,
+          },
+          og: parsed?.og ?? {
+            title: null,
+            description: null,
+            url: null,
+            type: null,
+            image: null,
+            siteName: null,
+          },
+          twitter: parsed?.twitter ?? {
+            card: null,
+            title: null,
+            description: null,
+            image: null,
+          },
+          schema: parsed?.schema ?? {
+            types: [],
+            valid: true,
+            errors: [],
+            raw: null,
+          },
+          links: pageLinks,
+          images: pageImages,
+          h1Count: parsed?.h1.count ?? 0,
+          h1Text: parsed?.h1.texts ?? [],
+          // #1003: bound oversize item ids/items-arrays and cap a page's own
+          // checks count at maxChecksPerPage — the cloud path publishes pages[]
+          // unstripped, so an over-cap single page hit the schema's silent
+          // slice. A page's checks mix many DIFFERENT rules, so this must NOT
+          // fold by (name,status) like capChecksForPublish does (see its doc).
+          checks: capMixedRuleChecksForPublish(pageChecks, REPORT_LIMITS.maxChecksPerPage),
+          redirectChain: page.redirectChain,
+          fetcherId: page.fetcherId,
+          fallbackReason: page.fallbackReason,
+        });
+      }
+
+      options?.onBatch?.({ pagesDone: pagesCrawled });
+      if (batch.length < batchSize) break;
     }
-    logger.traceEnd(pageAuditsSpan, { pageCount: pages.length });
+    logger.traceEnd(pageAuditsSpan, { pageCount: pagesCrawled });
 
     // Calculate totals from the per-rule map so rule meta is in reach:
     // warn checks in severity-"info" rules are recommendations — surfaced in
@@ -531,7 +572,7 @@ export function buildV1Report(
       // Present only when the crawler refused an off-site seed redirect (#1418).
       ...(refusedSeedRedirect ? { finalUrl: refusedSeedRedirect } : {}),
       timestamp: new Date().toISOString(),
-      totalPages: pages.length,
+      totalPages: pagesCrawled,
       passed,
       warnings,
       failed,
@@ -583,18 +624,27 @@ export function buildV1Report(
     // too. The reason names the host that throttled us.
     const rateLimitedCount =
       (crawl?.stats?.pagesRateLimited ?? 0) +
-      pages.filter((page) => isRateLimitStatus(page.status)).length;
+      pageStatuses.filter((page) => isRateLimitStatus(page.status)).length;
     const rateLimitedHosts = rateLimitedHostsFor(result.baseUrl, rateLimitedCount);
     if (rateLimitedCount > 0) {
       result.rateLimited = { pages: rateLimitedCount, hosts: rateLimitedHosts };
     }
-    const runStatus = deriveAuditStatusFromPages(pages, crawl?.stats?.pagesBlocked ?? 0, {
-      errors: crawl?.stats?.pagesRateLimited ?? 0,
-      hosts: rateLimitedHosts,
-    });
+    const runStatus = deriveAuditStatusFromPages(
+      pageStatuses,
+      crawl?.stats?.pagesBlocked ?? 0,
+      {
+        errors: crawl?.stats?.pagesRateLimited ?? 0,
+        hosts: rateLimitedHosts,
+      },
+      // #1822: the crawler's record of WHY the entry URL failed, so a zero-page
+      // cloud audit names DNS/TLS/connection/timeout/4xx/5xx/redirect/robots
+      // instead of "No pages were crawled".
+      crawl?.stats?.rootFailure,
+    );
     if (runStatus.status !== "completed") {
       result.status = runStatus.status;
       result.statusReason = runStatus.reason;
+      result.statusReasonCode = runStatus.reasonCode;
       // No real audit ⇒ no score (N/A), not 0/A. Renderers show the failed/
       // blocked banner and the API persists health_score = NULL (#586).
       // `partial` is deliberately excluded (#1829): a crawl that audited most
@@ -614,7 +664,7 @@ export function buildV1Report(
 
     sanitizeReportRuleResults(result.ruleResults);
 
-    logger.traceEnd(reportSpan, { totalPages: pages.length });
+    logger.traceEnd(reportSpan, { totalPages: pagesCrawled });
     return result;
   });
 }
@@ -679,7 +729,8 @@ export function buildV2Report(
 ): Effect.Effect<FullAuditReport, never, never> {
   return Effect.gen(function* () {
     const reportSpan = logger.traceStart("buildV2Report");
-    const batchSize = options?.batchSize ?? V2_REPORT_BATCH;
+    // Clamped for the same reason as buildV1Report's walk above.
+    const batchSize = Math.max(1, options?.batchSize ?? V2_REPORT_BATCH);
     const maxSummaryItems = REPORT_LIMITS.maxSummaryItems;
 
     const crawl = yield* storage
@@ -865,10 +916,14 @@ export function buildV2Report(
       rateLimitedErrors: crawl?.stats?.pagesRateLimited ?? 0,
       rateLimitedPages,
       rateLimitedHosts,
+      // #1822: same signal as v1 above. The streamed path has no pages[] to
+      // fall back on, so the crawl stats are its only source for the class.
+      rootFailure: crawl?.stats?.rootFailure,
     });
     if (runStatus.status !== "completed") {
       result.status = runStatus.status;
       result.statusReason = runStatus.reason;
+      result.statusReasonCode = runStatus.reasonCode;
       if (isScorelessStatus(runStatus.status) && result.healthScore) {
         result.healthScore.overall = null;
       }

@@ -1,8 +1,7 @@
 // Reconstruct AuditReport from SQLite storage
 // Rebuilds full report structure from crawl data
 
-import type { ResponseHeaders as StoredResponseHeaders } from "@squirrelscan/core-contracts";
-
+import { detachFromPage } from "@squirrelscan/audit-engine";
 import { buildCacheStats } from "@squirrelscan/core-contracts";
 import { loadAllRules, type RuleRunResult } from "@squirrelscan/rules";
 import { isRateLimitStatus } from "@squirrelscan/utils/rate-limit";
@@ -24,6 +23,7 @@ import {
   deriveAuditStatusFromPages,
 } from "@/audit/scoring";
 import { tagCarriedCheck } from "@/audit/smart-audits";
+import { retiredAuditReason } from "@/reports/retired";
 import { OTHER_CATEGORY } from "@/rules/categories";
 import { normalizeUrl } from "@/utils/url";
 
@@ -60,22 +60,6 @@ export interface SmartMergeOverride {
     unrenderedFindings?: number;
   };
   carriedLastSeen: Map<string, number>;
-}
-
-// Cookie values are crawl-session artifacts, not report content — publish
-// keeps `security/cookie-flags` rule-input-only and never sends the raw
-// Set-Cookie bytes onward (the publish schema doesn't accept `setCookie` and
-// would silently drop it anyway, but by then the bytes have already ridden
-// the wire and counted against the request body cap). `PageAudit.responseHeaders`
-// is typed WITHOUT `setCookie` (see `@/types`), but `page.headers` (the
-// storage-layer `ResponseHeaders` from core-contracts) carries it at
-// runtime — assigning it straight through would leak the raw value despite
-// the narrower static type.
-function omitSetCookie(
-  headers: StoredResponseHeaders
-): Omit<StoredResponseHeaders, "setCookie"> {
-  const { setCookie: _setCookie, ...responseHeaders } = headers;
-  return responseHeaders;
 }
 
 function computeSitemapCoverage(
@@ -143,23 +127,55 @@ function computeSitemapCoverage(
   return { orphanPages, missingPages };
 }
 
+/** Default page batch for the report's summary + pageAudits walk (#1913). */
+export const RECONSTRUCT_PAGE_BATCH = 100;
+
+export interface ReconstructOptions {
+  /**
+   * Pages read per `getPages` batch. The audit controller passes the same batch
+   * the streamed rules phases used, so one setting describes the whole
+   * post-crawl pipeline's residency.
+   */
+  batchSize?: number;
+}
+
 /**
  * Reconstruct full AuditReport from stored crawl data
  */
 export function reconstructReport(
   storage: SQLiteStorage,
   crawlId: string,
-  smartMerge?: SmartMergeOverride
+  smartMerge?: SmartMergeOverride,
+  options?: ReconstructOptions
 ): Effect.Effect<AuditReport, Error, never> {
   return Effect.gen(function* () {
+    // Clamped: SQLite reads `LIMIT 0` as no limit, so a zero batch would return
+    // the whole table every iteration while `offset += 0` never advanced.
+    const batchSize = Math.max(1, options?.batchSize ?? RECONSTRUCT_PAGE_BATCH);
     // 1. Get crawl metadata
     const crawl = yield* storage.getCrawl(crawlId);
     if (!crawl) {
       return yield* Effect.fail(new Error(`Crawl not found: ${crawlId}`));
     }
 
-    // 2. Get all pages for this crawl
-    const pageRecords = yield* storage.getPages(crawlId);
+    // `self disk --prune` reclaimed this audit's rule results (#1912). The pages
+    // and the crawl row survive, so without this the walk below would assemble a
+    // confident report with no findings at all — a wrong answer rather than a
+    // missing one. Refused here, at the bottom of every render path, so a caller
+    // that forgets the gate above still cannot produce one.
+    if (crawl.retiredAt !== undefined) {
+      return yield* Effect.fail(
+        new Error(`Audit ${retiredAuditReason(crawl.retiredAt)}: ${crawlId}`)
+      );
+    }
+
+    // 2. The crawl's pages are read in batches further down, not here (#1913).
+    // A PageRecord carries the page's full html, so one `getPages(crawlId)`
+    // held the whole crawl resident for the length of the report assembly —
+    // a second page-count-scaled term landing on top of the rules phase's
+    // peak. `getPages` orders by normalized_url ASC with or without
+    // LIMIT/OFFSET, so the batched walk visits exactly the sequence the
+    // resident array did: same summary entries, same page order, same report.
 
     // 3. Get robots.txt data
     const robotsRecord = yield* storage.getRobotsTxt(crawlId);
@@ -231,18 +247,9 @@ export function reconstructReport(
           }
         : undefined;
 
-    if (sitemaps) {
-      const coverage = computeSitemapCoverage(
-        pageRecords.map((p) => ({
-          url: p.normalizedUrl,
-          finalUrl: p.finalUrl,
-          statusCode: p.status,
-        })),
-        sitemaps.discovered.flatMap((s: SitemapData) => s.urls)
-      );
-      sitemaps.orphanPages = coverage.orphanPages;
-      sitemaps.missingPages = coverage.missingPages;
-    }
+    // Sitemap coverage needs one scalar triple per page, which the batched page
+    // walk below collects; computed once it has them (pure, so moving it past
+    // the walk changes nothing but when it runs).
 
     const resourceSizeRecords = yield* storage
       .getResourceSizes(crawlId)
@@ -251,18 +258,16 @@ export function reconstructReport(
       .getSitemapUrlStatuses(crawlId)
       .pipe(Effect.catchAll(() => Effect.succeed([])));
 
-    // 5. Get all links (for broken links lookup)
-    const links = yield* storage.getLinks(crawlId);
-
-    // 6. Get rule results grouped by page and by rule_id
-    const ruleResultsByPage = yield* storage.getRuleResultsByPage(crawlId);
-    const ruleResultsByRuleId = yield* storage.getRuleResultsByRuleId(crawlId);
+    // 6. Rule results, both groupings, from ONE read (#1920). The two readers
+    // this replaces differed only in their ORDER BY and each built its own
+    // CheckResult per row, so a crawl's checks were materialized twice: 203,687
+    // rows at 1,000 pages, 204 per page. `getRuleResultsGrouped` shares one
+    // object between the two maps and preserves both orders exactly.
+    const { byPage: ruleResultsByPage, byRuleId: ruleResultsByRuleId } =
+      yield* storage.getRuleResultsGrouped(crawlId);
 
     // 7. Load rule registry to get metadata
     const ruleRegistry = loadAllRules();
-
-    // Create lookup maps for link data
-    const linkByHref = new Map(links.map((l) => [l.href, l]));
 
     // 8. Build PageAudit[] from page records with parsed data and rule results
     const pages: PageAudit[] = [];
@@ -280,118 +285,142 @@ export function reconstructReport(
       securityIssues: [],
     };
 
-    for (const page of pageRecords) {
-      // Parse page HTML if available
-      const parsed = page.html ? parsePageRecord(page) : null;
+    // Scalars the sections after this walk need, so nothing has to keep a
+    // PageRecord alive past the batch it arrived in: three fields for sitemap
+    // coverage, the status for the audit-validity verdict + rate-limit count.
+    const coverageInputs: Array<{
+      url: string;
+      finalUrl?: string;
+      statusCode: number;
+    }> = [];
+    const pageStatuses: Array<{ status: number }> = [];
 
-      // Get links that appear on this page (per-page index lookup)
-      const pageLinkAppearances = yield* storage.getLinkAppearancesForPage(
-        crawlId,
-        page.normalizedUrl
-      );
-      const pageLinks = pageLinkAppearances.map((a) => {
-        const link = linkByHref.get(a.href);
-        return {
-          url: a.href,
-          text: a.anchorText,
-          isInternal: link?.isInternal ?? false,
-          status: link?.status,
-          error: link?.error,
-        };
+    for (let offset = 0; ; offset += batchSize) {
+      // Fails rather than degrading: the whole-crawl read this replaced
+      // propagated its StorageError too, and ending a BATCHED walk early would
+      // publish a confident report over a truncated page set instead.
+      const batch = yield* storage.getPages(crawlId, {
+        limit: batchSize,
+        offset,
       });
+      if (batch.length === 0) break;
 
-      // Get images that appear on this page (per-page index lookup)
-      const pageImageAppearances = yield* storage.getImageAppearancesForPage(
-        crawlId,
-        page.normalizedUrl
-      );
-      const pageImages = pageImageAppearances.map((a) => ({
-        src: a.src,
-        alt: a.alt ?? null,
-        width: null,
-        height: null,
-      }));
+      for (const page of batch) {
+        coverageInputs.push({
+          url: page.normalizedUrl,
+          finalUrl: page.finalUrl,
+          statusCode: page.status,
+        });
+        pageStatuses.push({ status: page.status });
+        // Parse page HTML if available
+        const parsed = page.html ? parsePageRecord(page) : null;
 
-      // Get rule results for this page
-      const pageChecks = ruleResultsByPage.get(page.normalizedUrl) ?? [];
+        // Image appearances still drive `summary.missingAltText`, which IS
+        // emitted. The per-page LINK query that used to sit here, and the
+        // whole-crawl `getLinks` that fed it, are gone with `PageAudit.links`
+        // (#1938): two queries per page and their arrays, for a field no
+        // consumer read.
+        const pageImageAppearances = yield* storage.getImageAppearancesForPage(
+          crawlId,
+          page.normalizedUrl
+        );
 
-      // Build summary data
-      if (parsed) {
-        if (!parsed.meta.title) summary.missingTitles.push(page.normalizedUrl);
-        if (!parsed.meta.description)
-          summary.missingDescriptions.push(page.normalizedUrl);
-        if (!parsed.og.title && !parsed.og.image)
-          summary.missingOgTags.push(page.normalizedUrl);
-        if (!parsed.twitter.card)
-          summary.missingTwitterCards.push(page.normalizedUrl);
-        if (!parsed.schema.types.length)
-          summary.missingSchemas.push(page.normalizedUrl);
-        if (parsed.h1.count > 1) summary.multipleH1s.push(page.normalizedUrl);
-        if (parsed.content.isThinContent)
-          summary.thinContentPages.push(page.normalizedUrl);
-      }
+        // Get rule results for this page
+        const pageChecks = ruleResultsByPage.get(page.normalizedUrl) ?? [];
 
-      // Check missing alt text. alt="" is the correct markup for a decorative
-      // image (HTML spec, WCAG H67), so only an absent attribute counts (#143).
-      for (const imgAppearance of pageImageAppearances) {
-        if (imgAppearance.alt === undefined || imgAppearance.alt === null) {
-          summary.missingAltText.push({
-            page: page.normalizedUrl,
-            image: imgAppearance.src,
-          });
+        // Build summary data
+        if (parsed) {
+          if (!parsed.meta.title)
+            summary.missingTitles.push(page.normalizedUrl);
+          if (!parsed.meta.description)
+            summary.missingDescriptions.push(page.normalizedUrl);
+          if (!parsed.og.title && !parsed.og.image)
+            summary.missingOgTags.push(page.normalizedUrl);
+          if (!parsed.twitter.card)
+            summary.missingTwitterCards.push(page.normalizedUrl);
+          if (!parsed.schema.types.length)
+            summary.missingSchemas.push(page.normalizedUrl);
+          if (parsed.h1.count > 1) summary.multipleH1s.push(page.normalizedUrl);
+          if (parsed.content.isThinContent)
+            summary.thinContentPages.push(page.normalizedUrl);
         }
+
+        // Check missing alt text. alt="" is the correct markup for a decorative
+        // image (HTML spec, WCAG H67), so only an absent attribute counts (#143).
+        for (const imgAppearance of pageImageAppearances) {
+          if (imgAppearance.alt === undefined || imgAppearance.alt === null) {
+            summary.missingAltText.push({
+              page: page.normalizedUrl,
+              image: imgAppearance.src,
+            });
+          }
+        }
+
+        // `meta` and `og` are the only DOM-derived fields still kept: publish
+        // reads them off the home page to seed the website record's title and
+        // description (`pickHomepageSummary`). Everything else the parse
+        // produced had no reader and is no longer carried (#1938).
+        //
+        // Detached because each of those strings is a SLICE of this page's html,
+        // and in JSC a retained slice pins the whole buffer it was cut from
+        // (#240). The batch is dropped a few lines later, so an attached title
+        // would hold its page's megabyte. Measured on ~1 MB pages: 77.5 MB
+        // retained across 80 pages attached, 2.1 MB detached.
+        const kept = parsed
+          ? detachFromPage({ meta: parsed.meta, og: parsed.og }, "report-page")
+          : null;
+
+        const pageAudit: PageAudit = {
+          url: page.url,
+          statusCode: page.status,
+          meta: kept?.meta ?? {
+            title: null,
+            description: null,
+            canonical: null,
+            robots: null,
+          },
+          og: kept?.og ?? {
+            title: null,
+            description: null,
+            url: null,
+            type: null,
+            image: null,
+            siteName: null,
+          },
+          checks: pageChecks,
+          redirectChain: page.redirectChain,
+          fetcherId: page.fetcherId,
+          fallbackReason: page.fallbackReason,
+        };
+
+        pages.push(pageAudit);
       }
 
-      const pageAudit: PageAudit = {
-        url: page.url,
-        statusCode: page.status,
-        loadTime: page.loadTimeMs,
-        meta: parsed?.meta ?? {
-          title: null,
-          description: null,
-          canonical: null,
-          robots: null,
-        },
-        og: parsed?.og ?? {
-          title: null,
-          description: null,
-          url: null,
-          type: null,
-          image: null,
-          siteName: null,
-        },
-        twitter: parsed?.twitter ?? {
-          card: null,
-          title: null,
-          description: null,
-          image: null,
-        },
-        schema: parsed?.schema ?? {
-          types: [],
-          valid: true,
-          errors: [],
-          raw: null,
-        },
-        links: pageLinks,
-        images: pageImages,
-        h1Count: parsed?.h1.count ?? 0,
-        h1Text: parsed?.h1.texts ?? [],
-        checks: pageChecks,
-        redirectChain: page.redirectChain,
-        fetcherId: page.fetcherId,
-        fallbackReason: page.fallbackReason,
-        responseHeaders: omitSetCookie(page.headers),
-        security: {
-          isHttps: page.url.startsWith("https"),
-          hasMixedContent: false,
-          mixedContentUrls: [],
-          insecureFormActions: [],
-          headers: page.securityHeaders,
-          httpToHttpsRedirect: false,
-        },
-      };
+      if (batch.length < batchSize) break;
+    }
 
-      pages.push(pageAudit);
+    if (sitemaps) {
+      const coverage = computeSitemapCoverage(
+        coverageInputs,
+        sitemaps.discovered.flatMap((s: SitemapData) => s.urls)
+      );
+      sitemaps.orphanPages = coverage.orphanPages;
+      sitemaps.missingPages = coverage.missingPages;
+    }
+
+    // Re-read the stamp AFTER every page and rule-result read. The check above
+    // happens once, outside any read transaction, so a `self disk --prune` in
+    // another process can commit between it and the reads below — and this
+    // function would then combine pre-retirement metadata with data that is
+    // already gone and return a confident empty report, which is the exact
+    // outcome the first check exists to prevent.
+    const stillThere = yield* storage.getCrawl(crawlId);
+    if (stillThere?.retiredAt !== undefined) {
+      return yield* Effect.fail(
+        new Error(
+          `Audit ${retiredAuditReason(stillThere.retiredAt)}: ${crawlId}`
+        )
+      );
     }
 
     // 9. Calculate totals from rule results
@@ -540,9 +569,9 @@ export function reconstructReport(
     // count; a stored 429/430 page adds to it.
     const rateLimitedCount =
       (crawl.stats?.pagesRateLimited ?? 0) +
-      pageRecords.filter((p) => isRateLimitStatus(p.status)).length;
+      pageStatuses.filter((p) => isRateLimitStatus(p.status)).length;
     const runStatus = deriveAuditStatusFromPages(
-      pageRecords,
+      pageStatuses,
       crawl.stats?.pagesBlocked ?? 0,
       {
         // #1829: a rate-limited fetch stores no page, so the count comes from
@@ -553,7 +582,11 @@ export function reconstructReport(
           crawl.baseUrl,
           crawl.stats?.pagesRateLimited ?? 0
         ),
-      }
+      },
+      // #1822: the CLI forks the engine's report path, so the crawler's root
+      // failure has to be threaded here too or `squirrel audit` keeps printing
+      // the generic reason the cloud no longer prints.
+      crawl.stats?.rootFailure
     );
 
     // Smart re-audits reflect carried prior state, so keep "completed" when
@@ -569,7 +602,11 @@ export function reconstructReport(
       smartMerge &&
       smartMerge.coverage.knownPages > smartMerge.coverage.auditedPages &&
       rateLimitedCount === 0
-        ? { status: "completed" as const, reason: undefined }
+        ? {
+            status: "completed" as const,
+            reason: undefined,
+            reasonCode: undefined,
+          }
         : runStatus;
 
     // No real audit ⇒ null score (N/A), not 0. Parity with the cloud/live
@@ -606,7 +643,11 @@ export function reconstructReport(
       sitemapUrlStatuses: sitemapUrlStatusEntries,
       // Only stamp when not a normal completed run; absent ⇒ completed (#489).
       ...(auditStatus.status !== "completed"
-        ? { status: auditStatus.status, statusReason: auditStatus.reason }
+        ? {
+            status: auditStatus.status,
+            statusReason: auditStatus.reason,
+            statusReasonCode: auditStatus.reasonCode,
+          }
         : {}),
       // #1829: coverage lost to throttling, in a form renderers can count
       // rather than parse out of the reason prose.
