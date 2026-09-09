@@ -1,6 +1,8 @@
 // JSON report output
 
+import type { AuditFailureReasonCode } from "@squirrelscan/core-contracts";
 import type { AuditReport, AuditStatus, CheckItem } from "../types";
+import { reportFailureReasonCode } from "../failure-notice";
 import { getScoreGrade } from "../scoring";
 import { getGroupName } from "../categories";
 import { groupIssuesByCategory, flattenIssuesBySeverity } from "../grouping";
@@ -33,6 +35,19 @@ interface SlimJsonReport {
     };
     timestamp: string;
     totalPages: number;
+    /**
+     * The page cap in force for this run (#1909). Present whenever the report
+     * carries a scan scope.
+     */
+    maxPages?: number;
+    /**
+     * What the run ASKED for, present only when that exceeded the ceiling and
+     * was clamped down to `maxPages` (#1909). Its ABSENCE is the normal case,
+     * so a caller detects a clamp by whether this field is here rather than by
+     * knowing the cap. Without it, a request for 10,000 pages and a 5,000-page
+     * site produce identical reports.
+     */
+    requestedMaxPages?: number;
     /** Smart audits (#110): present only when `smart_audits` ran. */
     coverage?: {
       auditedPages: number;
@@ -57,6 +72,8 @@ interface SlimJsonReport {
    * site?" without parsing `statusReason` prose.
    */
   rateLimited?: { pages: number; hosts: string[] };
+  /** Machine-readable class behind `statusReason` (#1822); absent pre-#1822. */
+  statusReasonCode?: AuditFailureReasonCode;
   score: {
     overall: number | null; // null ⇒ N/A (failed/0-page audit, #586)
     grade: string;
@@ -179,10 +196,22 @@ function buildSlimReport(report: AuditReport, version: string): SlimJsonReport {
         : {}),
       timestamp: report.timestamp,
       totalPages: report.totalPages,
+      ...(report.scanScope?.maxPages !== undefined
+        ? { maxPages: report.scanScope.maxPages }
+        : {}),
+      ...(report.scanScope?.requestedMaxPages !== undefined
+        ? { requestedMaxPages: report.scanScope.requestedMaxPages }
+        : {}),
       ...(report.coverage ? { coverage: report.coverage } : {}),
     },
     status: report.status ?? "completed",
     ...(report.statusReason ? { statusReason: report.statusReason } : {}),
+    // #1822: a programmatic consumer branches on the class, not on the prose.
+    // Derived when the stored report predates the field, so a CI gate reading
+    // it does not have to special-case older reports.
+    ...(report.status === "failed" || report.status === "blocked"
+      ? { statusReasonCode: reportFailureReasonCode(report) }
+      : {}),
     ...(report.rateLimited && report.rateLimited.pages > 0
       ? { rateLimited: report.rateLimited }
       : {}),

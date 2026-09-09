@@ -357,6 +357,93 @@ describe("security/leaked-secrets: real credentials still report", () => {
   });
 });
 
+// #1864 put a prefilter in front of the pattern loop: one pass over the content
+// builds a 4-gram index, and a pattern whose mandatory literals the index does
+// not contain is skipped instead of run. Every fixture above is a few hundred
+// characters, which is BELOW the size at which the index is built at all, so
+// none of them exercise it — the whole suite would stay green with the filter
+// deleting findings on every real page.
+//
+// These pin the only property the filter has to have: padding a fixture out to
+// the size of a real bundle must not lose anything it found unpadded. The pad
+// is deliberately larger than 32 KB, the point at which the index reaches its
+// widest table and the one arrangement its own unit tests did not reach.
+describe("security/leaked-secrets: the content prefilter never loses a finding", () => {
+  // Minified-looking JavaScript, so the gram index is populated the way a real
+  // bundle populates it. Nothing here is a credential shape.
+  const PAD = "function q0(a,b){return a+b*2}var z9=[1,2,3].map(q0);".repeat(1400);
+
+  const PREFIX = { github: "ghp_", stripe: "sk_live_", aws: "AKIA", slack: "xoxb-" };
+
+  // The quote is varied because the character IMMEDIATELY BEFORE a pattern's
+  // literal is what the index's window hash must not depend on, and `"` (34)
+  // and `'` (39) differ in the bit that a mis-masked hash leaks. One quote alone
+  // makes this suite blind to that whole class of bug.
+  const fixturesQuotedWith = (q: string): string[] => [
+    `const togetherKey = ${q}${TOGETHER_KEY}${q}`, // pragma: allowlist secret
+    `{${q}together_secret${q}:${q}${TOGETHER_KEY}${q}}`, // pragma: allowlist secret
+    `together\nAuthorization: Bearer ${TOGETHER_KEY}`, // pragma: allowlist secret
+    `const v = ${q}${PREFIX.github}016b3f2c9d4e7a815c0b2d6f39ea47c1b5d8${q};`, // pragma: allowlist secret
+    `const v = ${q}${PREFIX.stripe}51HxQ2mKz9pLvA3nR7dTfJw8Y${q};`, // pragma: allowlist secret
+    `const v = ${q}${PREFIX.aws}2XJQ7LP4RNVD3KEB${q};`, // pragma: allowlist secret
+    `const v = ${q}${PREFIX.slack}2094857361-3948572610-Kj8dPqR2mTvX5nB7wLcH1sZa${q};`, // pragma: allowlist secret
+    `const v = ${q}-----BEGIN RSA PRIVATE KEY-----${q};`, // pragma: allowlist secret
+    `var t={};t.a=${q}${TOGETHER_KEY}${q};/* together.ai client */`, // pragma: allowlist secret
+    `cfg[${q}apiKey${q}] = ${q}${TOGETHER_KEY}${q}; // together`, // pragma: allowlist secret
+  ];
+  const fixtures = ['"', "'"].flatMap(fixturesQuotedWith);
+
+  // WHOLE findings, not just their values: a prefilter that skipped the pattern
+  // which classifies a value would let a broader pattern claim it instead, and
+  // the type, confidence, publicByDesign flag and location would all change
+  // while the value stayed the same.
+  test("every finding made unpadded is still made, unchanged, inside 70 KB of bundle", () => {
+    const lost: string[] = [];
+    for (const fixture of fixtures) {
+      const bare = scanContent(fixture, "inline-script");
+      expect(bare.length).toBeGreaterThan(0); // a vacuous fixture proves nothing
+      const padded = scanContent(`${PAD}\n;\n${fixture}\n;\n${PAD}`, "inline-script").map((f) =>
+        JSON.stringify(f)
+      );
+      for (const finding of bare) {
+        if (!padded.includes(JSON.stringify(finding))) {
+          const near = padded.find((p) => p.includes(finding.value));
+          lost.push(
+            `${fixture.slice(0, 40)} → ${JSON.stringify(finding)} became ${near ?? "nothing"}`
+          );
+        }
+      }
+    }
+    expect(lost).toEqual([]);
+  });
+
+  test("the pad on its own is not a credential", () => {
+    expect(scanContent(PAD, "inline-script")).toEqual([]);
+  });
+
+  // The context tier looks its keyword up in `content.toLowerCase()`, while the
+  // index folds ASCII case and leaves everything else alone. Two characters in
+  // Unicode lowercase INTO ASCII: U+212A KELVIN SIGN → "k" and U+0130 → "i" plus
+  // a combining dot. On a page carrying one, a keyword can be in the lowercased
+  // copy and absent from the index, and filtering on the index alone drops the
+  // finding.
+  test("a keyword that only exists after lowercasing is not filtered away", () => {
+    const KELVIN = String.fromCharCode(0x212a);
+    const UUID = "550e8400-e29b-41d4-a716-446655440000"; // pragma: allowlist secret
+    const pad = "var q=1;".repeat(60);
+    const ascii = `${pad}\npostmark_server_token = "${UUID}";\n${pad}`; // pragma: allowlist secret
+    // `postmar` + KELVIN lowercases to exactly `postmark`.
+    const folded = `${pad}\npostmar${KELVIN}_server_token = "${UUID}";\n${pad}`; // pragma: allowlist secret
+
+    expect(folded.toLowerCase().includes("postmark")).toBe(true);
+    expect(folded.includes("postmark")).toBe(false);
+
+    const expected = scanContent(ascii, "inline-script").map((f) => f.value);
+    expect(expected).toContain(UUID);
+    expect(scanContent(folded, "inline-script").map((f) => f.value)).toEqual(expected);
+  });
+});
+
 describe("classifyKeyContext", () => {
   test("names the key in front of a value", () => {
     expect(classifyKeyContext(`{filename:"x",sha256:"`, "together")).toBe("digest");

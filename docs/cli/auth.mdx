@@ -203,8 +203,13 @@ squirrel auth logout
 ## status
 
 Show the active credential: its **source** (login session vs env var,
-`SQUIRRELSCAN_API_KEY` or the `SQUIRREL_API_TOKEN` alias), and, for API keys,
-the org and granted **scopes**.
+`SQUIRRELSCAN_API_KEY` or the `SQUIRREL_API_TOKEN` alias), the **organization**
+it acts for, and, for API keys, the granted **scopes**.
+
+The org line is the one to read before spending anything. Cloud audits are
+charged to your **active org**, which the dashboard org switcher sets. If you
+belong to more than one org, `status` names which one is active and how many you
+have, and [`squirrel keys create`](/cli/keys#create) refuses to guess.
 
 ### Usage
 
@@ -229,17 +234,38 @@ squirrel auth status
 ```text
 Authenticated as you@example.com
   Source: logged-in session
+  Org: acme (Acme Inc)
+  Org id: org_2xK9vQ
+  Active org of 2. Cloud runs spend this org's credits; switch orgs in the dashboard.
   Device: macbook-pro
   Expires: Feb 2, 2027
   Credits: 950
 ```
 
+`Org` shows the slug (also what your dashboard URL uses); `Org id` shows the id
+that appears on credit ledger rows. The count line appears only when you belong
+to more than one org. Resolving the org needs the API, so the org lines are
+omitted when it can't be reached: `status` still reports your identity.
+
+The active org is **server state**, set by the org switcher in the dashboard.
+There is no CLI flag that retargets an audit's spend: `--org` selects an org for
+[`squirrel keys`](/cli/keys) only. To bill a run to a different org, switch orgs
+in the dashboard, or use an API key minted for that org.
+
 With an API key via `SQUIRRELSCAN_API_KEY` (note the `Source` line and the scopes):
+
+<Note>
+The identity endpoint this command calls accepts only the login token issued by
+`squirrel auth login`, so an `sq_` **org API key** currently reports that it
+cannot be verified here rather than the output below. The key itself is fine:
+check it against `squirrel credits` or an audit instead.
+</Note>
 
 ```text
 Authenticated as ci@acme.com
   Source: SQUIRRELSCAN_API_KEY env var
   Org: Acme Inc
+  Org id: org_2xK9vQ
   Key: CI – production
   Scopes: audits:write, credits:read
   Key env: production
@@ -266,17 +292,32 @@ squirrel auth status --json
     "scopes": ["audits:write", "credits:read"],
     "keyEnv": "production"
   },
-  "org": { "id": "org_123", "name": "Acme Inc" }
+  "org": { "id": "org_123", "slug": null, "name": "Acme Inc" }
+}
+```
+
+For a login session the same call reports the active org and the org count:
+
+```json
+{
+  "authenticated": true,
+  "source": "login",
+  "user": { "id": "u_123", "email": "you@example.com", "name": "You" },
+  "token": { "deviceName": "macbook-pro", "expiresAt": "2027-02-02T00:00:00.000Z" },
+  "org": { "id": "org_2xK9vQ", "slug": "acme", "name": "Acme Inc" },
+  "orgCount": 2
 }
 ```
 
 <Note>
 **`--json` schema additions.** The `user` and `token` objects are unchanged. New
-fields are **additive**: `source` (`"env"` | `"login"`), and, when authenticated
-with an API key, `apiKey` (name, scopes, keyEnv) and `org` (id, name); plus
-`shadowedLoginEmail` when an env token is overriding a login session. One value
-change: `token.expiresAt` is `null` for env tokens (it was always a string for
-login sessions). Parse defensively (`expiresAt` may be `null`).
+fields are **additive**: `source` (`"env"` | `"login"`); `apiKey` (name, scopes,
+keyEnv) when authenticated with an API key; `org` (id, slug, name) and
+`orgCount`; plus `shadowedLoginEmail` when an env token is overriding a login
+session. `org.slug` is `null` for an API-key credential, and `org` / `orgCount`
+are absent when the org could not be resolved. One value change:
+`token.expiresAt` is `null` for env tokens (it was always a string for login
+sessions). Parse defensively (`expiresAt` may be `null`).
 </Note>
 
 ---

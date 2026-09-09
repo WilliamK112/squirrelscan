@@ -6,6 +6,8 @@
 // tsconfig (e.g. the API Worker). types.ts is the leaf type module. (#195)
 import type { RuleRunResult } from "@squirrelscan/rules/types";
 import type {
+  AuditFailureDetail,
+  AuditFailureReasonCode,
   AuditStatus,
   CheckResult,
   HealthScore,
@@ -13,6 +15,10 @@ import type {
   GroupScore,
   RuleGroup,
 } from "@squirrelscan/core-contracts";
+import {
+  auditFailureDetail,
+  auditFailureReasonText,
+} from "@squirrelscan/core-contracts/failure-reason";
 import { getScoreGrade, getScoreColor } from "@squirrelscan/core-contracts/scoring";
 import { isRateLimitStatus } from "@squirrelscan/utils/rate-limit";
 
@@ -79,6 +85,38 @@ export interface CarriedFinding {
    * relabelling it "carried" — both preserve an already-set provenance.
    */
   neverRendered?: boolean;
+  /**
+   * (#1876) When set, {@link carriedFindingToCheck} stamps the replayed check
+   * `provenance: "carried"` + this `lastSeenAt` itself, instead of leaving the
+   * caller to do it from a `${url}|${rule}|${check}` → lastSeenAt map.
+   *
+   * WHY IT MOVED: that map is one entry per carried finding, so a partial
+   * re-audit of a site with tens of thousands of open findings has to build tens
+   * of thousands of entries to tag a report that keeps a bounded sample of them.
+   * Stamping at construction is the same information carried by the object that
+   * needs it. Left undefined by the sampled path, where the caller's tagging pass
+   * still runs and the map is bounded by the run.
+   */
+  lastSeenAt?: number;
+}
+
+/**
+ * (#1876) The carried half of the union, pre-indexed and BOUNDED, for callers that
+ * cannot hold the carried findings themselves.
+ *
+ * The complete-store finalize scores from tallies and uses the union map only as
+ * the report body, so it folds carried findings into a per-rule sample as they
+ * stream and hands the result over through this. `carriedFindings` stays the input
+ * for the sampled path, where the union IS the score and is bounded by the run.
+ */
+export interface CarriedUnionSource {
+  /** Rules with at least one carried finding (page-scope ones matter). */
+  ruleIds(): Iterable<string>;
+  /** The carried checks to replay into the union for a rule — already bounded. */
+  checksFor(ruleId: string): readonly CheckResult[];
+  /** How many pages in `carriedPageUrls` have a carried finding for this rule.
+   *  `carriedPageUrls.size` minus this is the clean-carried pass count. */
+  dirtyCarriedPageCount(ruleId: string): number;
 }
 
 /** Minimal rule meta the union scorer needs. */
@@ -95,6 +133,9 @@ export interface MergedScoringInput {
   carriedPageUrls: Set<string>;
   /** ruleId -> meta for rules absent from `freshResults` (carried-only rules). */
   ruleMetaIndex: Map<string, RuleRunResult["meta"]>;
+  /** (#1876) Bounded pre-indexed carried side. When present it REPLACES
+   *  `carriedFindings` entirely — pass `[]` for that. */
+  carriedSource?: CarriedUnionSource;
 }
 
 /**
@@ -112,10 +153,56 @@ export interface MergedScoringInput {
  * Site-scope rules are page-independent — their fresh checks pass through
  * unchanged (a site rule runs over whatever pages this run crawled).
  */
+/**
+ * Replay ONE carried finding as a union check. Extracted so the bounded
+ * complete-store fold (#1873) builds carried checks with byte-identical shape to
+ * the materialized union built here — the two must stay one construction, or the
+ * two scoring paths diverge on carried detail.
+ *
+ * The captured payload (items/details/pages) is replayed so a carried finding
+ * renders with the same per-item detail as a fresh one. (#1652) The
+ * never-rendered case is stamped HERE, at the one place a union check is
+ * created, so every consumer (report rendering, the hosted rescore, issue-sync)
+ * inherits it without a second lookup — and deliberately WITHOUT `lastSeenAt`:
+ * nothing has ever observed this finding, so there is no date to show.
+ */
+export function carriedFindingToCheck(
+  f: CarriedFinding,
+  normalizedUrl: string
+): CheckResult {
+  const payload = parseCarriedPayload(f.payload);
+  return {
+    name: f.checkName,
+    status: f.status === "fail" ? "fail" : "warn",
+    // (#1881) Restore the parent check's page-level text for an item row, so the
+    // replayed union check renders exactly as it did before item rows became
+    // item-scoped. Report grouping keys on the message, so reading the item's own
+    // text here would split one carried aggregate into one group per item. `m`
+    // is the sole marker (see reconstructRuleChecks): when it is present the
+    // row's own value/expected are null by construction, so an absent `v`/`e`
+    // means the source check carried none.
+    message: payload.m ?? f.message,
+    pageUrl: normalizedUrl,
+    value: (payload.m !== undefined ? payload.v : f.value) ?? undefined,
+    expected: (payload.m !== undefined ? payload.e : f.expected) ?? undefined,
+    ...(payload.items ? { items: payload.items } : {}),
+    ...(payload.details ? { details: payload.details } : {}),
+    ...(payload.pages ? { pages: payload.pages } : {}),
+    // Key ORDER matters: the sampled path's caller ASSIGNS provenance then
+    // lastSeenAt after this returns, so stamping them last here serializes
+    // identically to a check the caller tagged (#1876).
+    ...(f.neverRendered
+      ? { provenance: "unrendered" as const }
+      : f.lastSeenAt !== undefined
+        ? { provenance: "carried" as const, lastSeenAt: f.lastSeenAt }
+        : {}),
+  };
+}
+
 export function buildScoringResultsFromMerged(
   input: MergedScoringInput
 ): Map<string, RuleRunResult> {
-  const { freshResults, carriedFindings, carriedPageUrls, ruleMetaIndex } =
+  const { freshResults, carriedFindings, carriedPageUrls, ruleMetaIndex, carriedSource } =
     input;
 
   // Clone fresh results (don't mutate the caller's map / arrays). Preserve any
@@ -134,17 +221,20 @@ export function buildScoringResultsFromMerged(
     });
   }
 
-  // Index carried findings by (ruleId -> normalizedUrl -> findings).
+  // Index carried findings by (ruleId -> normalizedUrl -> findings). Skipped when
+  // the caller supplied a pre-indexed bounded source (#1876).
   const carriedByRule = new Map<string, Map<string, CarriedFinding[]>>();
-  for (const f of carriedFindings) {
-    let byUrl = carriedByRule.get(f.ruleId);
-    if (!byUrl) {
-      byUrl = new Map();
-      carriedByRule.set(f.ruleId, byUrl);
+  if (!carriedSource) {
+    for (const f of carriedFindings) {
+      let byUrl = carriedByRule.get(f.ruleId);
+      if (!byUrl) {
+        byUrl = new Map();
+        carriedByRule.set(f.ruleId, byUrl);
+      }
+      const list = byUrl.get(f.normalizedUrl) ?? [];
+      list.push(f);
+      byUrl.set(f.normalizedUrl, list);
     }
-    const list = byUrl.get(f.normalizedUrl) ?? [];
-    list.push(f);
-    byUrl.set(f.normalizedUrl, list);
   }
 
   // Every page-scope rule that exists this run OR carried a finding applies to
@@ -153,7 +243,7 @@ export function buildScoringResultsFromMerged(
   for (const [ruleId, result] of union) {
     if (result.meta.scope === "page") pageScopeRuleIds.add(ruleId);
   }
-  for (const ruleId of carriedByRule.keys()) {
+  for (const ruleId of carriedSource?.ruleIds() ?? carriedByRule.keys()) {
     const meta = union.get(ruleId)?.meta ?? ruleMetaIndex.get(ruleId);
     if (meta?.scope === "page") pageScopeRuleIds.add(ruleId);
   }
@@ -177,29 +267,14 @@ export function buildScoringResultsFromMerged(
     // the replay were gated on carriedPageUrls (which excludes crawled pages) that
     // finding would persist open in storage yet vanish from the union score,
     // report, and issue-sync — re-inflating exactly the score #1167 protects.
-    if (carriedForRule) {
+    if (carriedSource) {
+      // Already built and already bounded — the caller replayed each carried
+      // finding as it streamed and kept a per-rule sample.
+      for (const check of carriedSource.checksFor(ruleId)) result.checks.push(check);
+    } else if (carriedForRule) {
       for (const [url, findings] of carriedForRule) {
         for (const f of findings) {
-          // Replay the captured payload (items/details/pages) so carried
-          // findings render with the same per-item detail as fresh ones.
-          const payload = parseCarriedPayload(f.payload);
-          result.checks.push({
-            name: f.checkName,
-            status: f.status === "fail" ? "fail" : "warn",
-            message: f.message,
-            pageUrl: url,
-            value: f.value ?? undefined,
-            expected: f.expected ?? undefined,
-            ...(payload.items ? { items: payload.items } : {}),
-            ...(payload.details ? { details: payload.details } : {}),
-            ...(payload.pages ? { pages: payload.pages } : {}),
-            // (#1652) Stamp the never-rendered case HERE, at the one place the
-            // union check is created, so every consumer of the union (report
-            // rendering, the hosted rescore, issue-sync) inherits it without a
-            // second lookup — and deliberately WITHOUT `lastSeenAt`: nothing has
-            // ever observed this finding, so there is no date to show.
-            ...(f.neverRendered ? { provenance: "unrendered" as const } : {}),
-          });
+          result.checks.push(carriedFindingToCheck(f, url));
         }
       }
     }
@@ -211,10 +286,17 @@ export function buildScoringResultsFromMerged(
     // passed+total. Only carriedPageUrls (un-crawled active pages) are eligible —
     // a crawled page's pass/fail is already counted by its fresh (or replayed
     // carried) check, so it must not also count here.
+    // (#1876) Counted, not enumerated, when the caller pre-indexed: it tracked how
+    // many carried pages have a finding for the rule as they streamed, and
+    // |carriedPageUrls| minus that is the same set difference.
     let cleanCarriedPasses = 0;
-    for (const url of carriedPageUrls) {
-      const findings = carriedForRule?.get(url);
-      if (!findings || findings.length === 0) cleanCarriedPasses++;
+    if (carriedSource) {
+      cleanCarriedPasses = carriedPageUrls.size - carriedSource.dirtyCarriedPageCount(ruleId);
+    } else {
+      for (const url of carriedPageUrls) {
+        const findings = carriedForRule?.get(url);
+        if (!findings || findings.length === 0) cleanCarriedPasses++;
+      }
     }
     // ADD to any fresh-clean count the reconstruction stamped (#1023), rather
     // than overwrite — a complete-store re-audit has BOTH fresh crawled-clean
@@ -230,6 +312,14 @@ interface CarriedPayload {
   items?: CheckResult["items"];
   details?: CheckResult["details"];
   pages?: CheckResult["pages"];
+  /** (#1881) Parent check's PAGE-LEVEL message/value/expected, stashed by
+   * `flattenChecks` because an item row's own columns describe the ITEM (so its
+   * fingerprint follows the defect, not the page's item count). Absent on
+   * pre-#1881 rows and on whole-check rows, whose columns already hold the
+   * page-level text. */
+  m?: string;
+  v?: string;
+  e?: string;
 }
 
 /** Safely parse a carried finding's stored payload JSON. */
@@ -609,6 +699,15 @@ export interface AuditStatusSignals {
   rateLimitedPages?: number;
   /** Host(s) that throttled the crawl, for the reason text. */
   rateLimitedHosts?: readonly string[];
+  /**
+   * Why the entry URL could not be audited, recorded by the crawler on
+   * `CrawlStats.rootFailure` (#1822). Read ONLY in the no-content branches that
+   * are neither blocked nor rate limited, so it can never change the status of
+   * a run that produced content, and never displaces the #792 or #1829 reason.
+   * Absent ⇒ the pre-#1822 generic reasons, which is what every stats blob
+   * written before it has.
+   */
+  rootFailure?: AuditFailureDetail;
 }
 
 /**
@@ -620,6 +719,7 @@ export interface AuditStatusSignals {
 export function deriveAuditStatus(s: AuditStatusSignals): {
   status: AuditStatus;
   reason?: string;
+  reasonCode?: AuditFailureReasonCode;
 } {
   const BLOCKED_REASON =
     "Site blocked the crawler (bot protection / auth / rate limit)";
@@ -630,30 +730,58 @@ export function deriveAuditStatus(s: AuditStatusSignals): {
   const rateLimited = (s.rateLimitedErrors ?? 0) + (s.rateLimitedPages ?? 0);
   const hostText = formatRateLimitedHosts(s.rateLimitedHosts);
 
-  if (s.pagesCrawled === 0) {
-    // #1829: rate limiting gets its OWN blocked reason. It reads as "blocked"
-    // because nothing was auditable, but the remedy is to slow the crawl down,
-    // not to allowlist the crawler through a WAF.
-    if (rateLimited > 0 && blocked === 0) {
-      return {
-        status: "blocked",
-        reason: `Rate limited by ${hostText}; no pages could be fetched`,
-      };
+  // #1829: rate limiting gets its OWN blocked reason. It reads as "blocked"
+  // because nothing was auditable, but the remedy is to slow the crawl down,
+  // not to allowlist the crawler through a WAF. #1822 adds only the code: a 429
+  // is a 4xx refusal like the others, even though its fix differs.
+  const rateLimitedResult = (): {
+    status: AuditStatus;
+    reason: string;
+    reasonCode: "http_4xx";
+  } => ({
+    status: "blocked",
+    reason: `Rate limited by ${hostText}; no pages could be fetched`,
+    reasonCode: "http_4xx",
+  });
+
+  // #1822: a block keeps its #792 status AND its #792 sentence — the copy is
+  // load-bearing for the Sentry classifier and for the renderers' blocked
+  // branch. Only the machine-readable code is added, plus the crawler's own
+  // detail (which carries the status and the WAF provider when it detected one)
+  // appended to the end of the same sentence.
+  const blockedResult = (): { status: AuditStatus; reason: string; reasonCode: "http_4xx" } => {
+    const detail = s.rootFailure?.code === "http_4xx" ? s.rootFailure.detail : undefined;
+    return {
+      status: "blocked",
+      reason: detail ? `${BLOCKED_REASON}: ${detail}` : BLOCKED_REASON,
+      reasonCode: "http_4xx",
+    };
+  };
+
+  // The generic fallbacks are kept verbatim for a crawl that recorded nothing
+  // (an older stats blob, or a failure shape the crawler cannot attribute), and
+  // classified `unknown` — which the renderers still print as a failure.
+  const failedResult = (fallback: string) => {
+    const failure = s.rootFailure;
+    if (!failure) {
+      return { status: "failed" as const, reason: fallback, reasonCode: "unknown" as const };
     }
-    return blocked > 0
-      ? { status: "blocked", reason: BLOCKED_REASON }
-      : { status: "failed", reason: "No pages were crawled" };
+    return {
+      status: "failed" as const,
+      reason: auditFailureReasonText(failure),
+      reasonCode: failure.code,
+    };
+  };
+
+  if (s.pagesCrawled === 0) {
+    if (rateLimited > 0 && blocked === 0) return rateLimitedResult();
+    return blocked > 0 ? blockedResult() : failedResult("No pages were crawled");
   }
   if (s.contentPages === 0) {
-    if (rateLimited > 0 && blocked === 0) {
-      return {
-        status: "blocked",
-        reason: `Rate limited by ${hostText}; no pages could be fetched`,
-      };
-    }
+    if (rateLimited > 0 && blocked === 0) return rateLimitedResult();
     return blocked > 0
-      ? { status: "blocked", reason: BLOCKED_REASON }
-      : { status: "failed", reason: "Site unreachable, no pages could be fetched" };
+      ? blockedResult()
+      : failedResult("Site unreachable, no pages could be fetched");
   }
   // Content WAS gathered, but rate limiting shrank the audited set. The numbers
   // present are trustworthy; the coverage is not, and a multi-site operator has
@@ -691,10 +819,12 @@ export function deriveAuditStatusFromPages(
   rateLimit: {
     errors?: number;
     hosts?: readonly string[];
-  } = {}
+  } = {},
+  rootFailure?: AuditFailureDetail
 ): {
   status: AuditStatus;
   reason?: string;
+  reasonCode?: AuditFailureReasonCode;
 } {
   // #1829: a stored 429/430 page is rate limiting, not a bot wall. Counted into
   // its own bucket so the reason text sends the reader to the right fix.
@@ -707,6 +837,37 @@ export function deriveAuditStatusFromPages(
     rateLimitedErrors: rateLimit.errors ?? 0,
     rateLimitedPages,
     rateLimitedHosts: rateLimit.hosts,
+    // #1822: the crawl stats are the source of truth. When they carry nothing —
+    // a report reconstructed from pages alone, or a pre-#1822 crawl — fall back
+    // to the stored statuses, which still name the class for an all-4xx site.
+    rootFailure: rootFailure ?? rootFailureFromPages(pages),
+  });
+}
+
+/**
+ * Last-resort root failure built from stored page statuses (#1822), for reports
+ * whose crawl stats predate `rootFailure`. Only meaningful when NO page
+ * returned content, which is the only situation `deriveAuditStatus` consults
+ * it in; the dominant non-2xx status names the class.
+ */
+function rootFailureFromPages(
+  pages: readonly { status: number }[]
+): AuditFailureDetail | undefined {
+  const errors = pages.filter((p) => p.status >= 400);
+  if (errors.length === 0 || errors.length !== pages.length) return undefined;
+  const counts = new Map<number, number>();
+  for (const page of errors) counts.set(page.status, (counts.get(page.status) ?? 0) + 1);
+  let dominant = errors[0]!.status;
+  let best = 0;
+  for (const [status, count] of counts) {
+    if (count > best) {
+      best = count;
+      dominant = status;
+    }
+  }
+  return auditFailureDetail({
+    code: dominant >= 500 ? "http_5xx" : "http_4xx",
+    status: dominant,
   });
 }
 

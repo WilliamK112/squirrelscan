@@ -51,7 +51,7 @@ _squirrel_completions() {
   local keys_commands="create list revoke"
 
   # Self subcommands
-  local self_commands="install update completion doctor version settings uninstall"
+  local self_commands="disk install update completion doctor version settings uninstall"
 
   # Config subcommands
   local config_commands="show set path validate"
@@ -155,15 +155,15 @@ _squirrel_completions() {
           return 0
           ;;
         create)
-          COMPREPLY=( $(compgen -W "--name --scopes --expires-days --shell --json" -- "\${cur}") )
+          COMPREPLY=( $(compgen -W "--name --org --scopes --expires-days --shell --json" -- "\${cur}") )
           return 0
           ;;
         list)
-          COMPREPLY=( $(compgen -W "--json" -- "\${cur}") )
+          COMPREPLY=( $(compgen -W "--org --json" -- "\${cur}") )
           return 0
           ;;
         revoke)
-          COMPREPLY=( $(compgen -W "--force --json" -- "\${cur}") )
+          COMPREPLY=( $(compgen -W "--org --force --json" -- "\${cur}") )
           return 0
           ;;
       esac
@@ -301,6 +301,7 @@ _squirrel() {
   )
 
   self_commands=(
+    'disk:Report what ~/.squirrel is using'
     'install:Bootstrap local installation'
     'update:Check and apply updates'
     'completion:Generate shell completions'
@@ -410,17 +411,21 @@ _squirrel() {
             create)
               _arguments \\
                 '--name[Key name]:name' \\
+                '--org[Organization slug or id to mint for]:org' \\
                 '--scopes[Comma-separated scopes]:scopes' \\
                 '--expires-days[Days until expiry]:days' \\
                 '--shell[Append the export line to your shell rc file]' \\
                 '--json[Output as JSON]'
               ;;
             list)
-              _arguments '--json[Output as JSON]'
+              _arguments \\
+                '--org[Only show keys for this organization slug or id]:org' \\
+                '--json[Output as JSON]'
               ;;
             revoke)
               _arguments \\
                 '1:key prefix or id:' \\
+                '--org[Only search this organization slug or id]:org' \\
                 '--force[Skip confirmation prompt]' \\
                 '--json[Output as JSON]'
               ;;
@@ -560,6 +565,8 @@ complete -c squirrel -n "__fish_seen_subcommand_from keys; and not __fish_seen_s
 
 # Keys create options
 complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from create" -l name -d "Key name"
+complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from create" -l org -d "Organization slug or id to mint for"
+complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from list revoke" -l org -d "Organization slug or id to limit to"
 complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from create" -l scopes -d "Comma-separated scopes"
 complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from create" -l expires-days -d "Days until expiry"
 complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from create" -l shell -d "Append the export line to your shell rc file"
@@ -569,13 +576,14 @@ complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subco
 complete -c squirrel -n "__fish_seen_subcommand_from keys; and __fish_seen_subcommand_from revoke" -l force -d "Skip confirmation prompt"
 
 # Self subcommands
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings auth uninstall" -a install -d "Bootstrap local installation"
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings auth uninstall" -a update -d "Check and apply updates"
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings auth uninstall" -a completion -d "Generate shell completions"
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings auth uninstall" -a doctor -d "Run health checks"
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings auth uninstall" -a version -d "Show version information"
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings auth uninstall" -a settings -d "Manage CLI settings"
-complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from install update completion doctor version settings uninstall" -a uninstall -d "Remove squirrel from the system"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a disk -d "Report what ~/.squirrel is using"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a install -d "Bootstrap local installation"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a update -d "Check and apply updates"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a completion -d "Generate shell completions"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a doctor -d "Run health checks"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a version -d "Show version information"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings auth uninstall" -a settings -d "Manage CLI settings"
+complete -c squirrel -n "__fish_seen_subcommand_from self; and not __fish_seen_subcommand_from disk install update completion doctor version settings uninstall" -a uninstall -d "Remove squirrel from the system"
 
 # Shell completion options
 complete -c squirrel -n "__fish_seen_subcommand_from completion" -a "bash zsh fish" -d "Shell type"

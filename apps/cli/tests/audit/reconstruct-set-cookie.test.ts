@@ -1,9 +1,14 @@
-// reconstructReport strips Set-Cookie from each page's responseHeaders before
-// the report is ever handed to the publish path (#973/#1035). Cookie values
-// are crawl-session artifacts, not report content — the publish schema
-// doesn't accept `setCookie`, so this strip is defense-in-depth: the bytes
-// never ride the wire in the first place, regardless of whether a given
-// publish path also happens to drop pages[] downstream.
+// Set-Cookie must never reach a report (#973/#1035). Cookie values are
+// crawl-session artifacts, not report content.
+//
+// The report used to carry each page's `responseHeaders` with Set-Cookie
+// stripped out of it. Since #1938 it carries no response headers at all —
+// nothing read them — so there is no strip left to forget. These tests assert
+// the property over the whole serialized report rather than one field, so a
+// cookie arriving by some other route would fail them too.
+//
+// Note the security/cookie-flags rule deliberately keeps cookie NAMES in its
+// check items; it discards the values. This is about the values.
 
 import type { PageRecord } from "@squirrelscan/core-contracts";
 
@@ -114,19 +119,18 @@ function pageWithSetCookie(setCookie: string | null): PageRecord {
   };
 }
 
-// `PageAudit.responseHeaders` is typed WITHOUT `setCookie` — read via a loose
-// cast so the assertion checks the raw runtime shape (proving the field is
-// truly absent, not just hidden from the static type).
-function setCookieOf(report: AuditReport): string | null | undefined {
-  return (
-    report.pages[0]?.responseHeaders as
-      | { setCookie?: string | null }
-      | undefined
-  )?.setCookie;
+/**
+ * The whole REPORT, as JSON, so the assertion sees the runtime shape rather
+ * than the static type and covers every field rather than one page's. A cookie
+ * hiding under a field the type does not declare would still be a leak, and so
+ * would one that reached a check's items or the summary.
+ */
+function reportJson(report: AuditReport): string {
+  return JSON.stringify(report);
 }
 
-describe("reconstructReport strips Set-Cookie from responseHeaders (#973/#1035)", () => {
-  test("multi-cookie set-cookie is stripped, other headers survive", async () => {
+describe("reconstructReport never carries Set-Cookie (#973/#1035)", () => {
+  test("a multi-cookie header reaches no part of the report", async () => {
     const { store, crawlId } = await freshCrawl([
       pageWithSetCookie(
         "session=abc123; Path=/; HttpOnly\nconsent=1; Path=/; Secure"
@@ -134,28 +138,31 @@ describe("reconstructReport strips Set-Cookie from responseHeaders (#973/#1035)"
     ]);
     const report = await run(reconstructReport(store, crawlId, undefined));
 
-    expect(setCookieOf(report)).toBeUndefined();
-    expect(report.pages[0]?.responseHeaders?.server).toBe("nginx");
-    expect(report.pages[0]?.responseHeaders?.contentType).toBe("text/html");
+    const json = reportJson(report);
+    expect(json).not.toContain("session=abc123");
+    expect(json).not.toContain("consent=1");
+    expect(json.toLowerCase()).not.toContain("setcookie");
+    expect(report.pages[0]?.url).toBe(SITE);
     await run(store.close());
   });
 
-  test("single cookie is stripped too", async () => {
+  test("a single cookie reaches no part of the report", async () => {
     const { store, crawlId } = await freshCrawl([
       pageWithSetCookie("session=abc123; HttpOnly"),
     ]);
     const report = await run(reconstructReport(store, crawlId, undefined));
 
-    expect(setCookieOf(report)).toBeUndefined();
+    expect(reportJson(report)).not.toContain("session=abc123");
     await run(store.close());
   });
 
-  test("no set-cookie: responseHeaders pass through unaffected", async () => {
+  test("response headers are not carried at all, cookie or no cookie", async () => {
+    // Since #1938 the guarantee is structural: nothing read `responseHeaders`,
+    // so the report stopped carrying them and there is no strip left to forget.
     const { store, crawlId } = await freshCrawl([pageWithSetCookie(null)]);
     const report = await run(reconstructReport(store, crawlId, undefined));
 
-    expect(setCookieOf(report)).toBeUndefined();
-    expect(report.pages[0]?.responseHeaders?.server).toBe("nginx");
+    expect(report.pages[0]?.responseHeaders).toBeUndefined();
     await run(store.close());
   });
 });

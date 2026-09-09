@@ -92,6 +92,7 @@ import { logger } from "./adapter-logger";
 import {
   buildV1Report,
   buildRobotsData,
+  type BuildV1ReportOptions,
   type FullAuditReport,
   type RuleExecutionResult,
 } from "./report-stream";
@@ -105,6 +106,8 @@ import {
   type PageSignalCollector,
   type StreamPageRulesHooks,
 } from "./streaming";
+import { collectDroppedBatch } from "./batch-gc";
+import { detachFromPage, detachParsedPage } from "./detach";
 import { resolveCloakingProbes } from "./cloaking-probe";
 import { createSiteQuery } from "./site-query";
 import { confirmSoft404Candidates } from "./soft404-confirm";
@@ -514,6 +517,122 @@ export interface PreFetchedAssets {
  *
  * This replaces inline resource fetching that previously happened inside runRulesOnStorage().
  */
+/**
+ * The DOM-derived and scalar page signal {@link fetchAssetsFromOccurrences}
+ * needs, accumulated across page batches by {@link createSiteAssetCollector}.
+ * Everything here is bounded by the site's distinct sub-resource URLs, not by
+ * page count × page size, which is what lets the cloud collect it with only one
+ * batch of DOMs live at a time (#1860).
+ */
+export interface SiteAssetOccurrences {
+  css: Map<string, Set<string>>;
+  images: Map<string, Set<string>>;
+  scripts: Map<string, Set<string>>;
+  pdfs: Map<string, Set<string>>;
+  /** Scalars for the sitemap-coverage pass — v1's non-WAF parsed-page list. */
+  coveragePages: Array<{ url: string; finalUrl?: string; statusCode: number }>;
+  /** Every page absorbed, WAF and non-HTML included — v1's `siteContext.length`,
+   * which sizes the script fetcher's per-page budget. */
+  pageCount: number;
+}
+
+function emptySiteAssetOccurrences(): SiteAssetOccurrences {
+  return {
+    css: new Map(),
+    images: new Map(),
+    scripts: new Map(),
+    pdfs: new Map(),
+    coveragePages: [],
+    pageCount: 0,
+  };
+}
+
+/**
+ * Batch-absorbing collector for the asset phase's page signal. `absorb` MUST be
+ * called while the batch's DOMs are live (stylesheet + script srcs are read off
+ * `parsed.document`); everything it retains is DOM-free, so the caller can drop
+ * the batch immediately after. Feeding it the whole site context in one call is
+ * exactly what {@link fetchResourceAssets} does, so the streamed and resident
+ * paths run the same accumulation code.
+ */
+export function createSiteAssetCollector(baseUrl: string): {
+  absorb: (siteContext: SiteContextPage[]) => void;
+  occurrences: SiteAssetOccurrences;
+} {
+  const occurrences = emptySiteAssetOccurrences();
+  let baseOrigin: string | null = null;
+  try {
+    baseOrigin = baseUrl ? new URL(baseUrl).origin : null;
+  } catch {
+    // ignore — no base origin means no same-origin PDF links are collected
+  }
+
+  return {
+    occurrences,
+    absorb(siteContext: SiteContextPage[]): void {
+      // Same filtering as runRulesOnStorage: parsed, non-WAF. Note the page
+      // COUNT below still counts every page, matching v1's siteContext.length.
+      occurrences.pageCount += siteContext.length;
+      const parsedPages: Array<{
+        url: string;
+        finalUrl?: string;
+        statusCode: number;
+        parsed: ParsedPage;
+      }> = [];
+
+      for (const { page, parsed } of siteContext) {
+        if (!parsed) continue;
+        const wafChallenge = detectWafChallengePage({
+          status: page.status,
+          headers: {
+            server: page.headers.server,
+            cfCacheStatus: page.headers.cfCacheStatus,
+            xCache: page.headers.xCache,
+          },
+          html: page.html,
+        });
+        if (wafChallenge.detected) continue;
+
+        parsedPages.push({
+          url: page.normalizedUrl,
+          finalUrl: page.finalUrl,
+          statusCode: page.status,
+          parsed,
+        });
+      }
+
+      for (const page of parsedPages) {
+        occurrences.coveragePages.push({
+          url: page.url,
+          finalUrl: page.finalUrl,
+          statusCode: page.statusCode,
+        });
+      }
+
+      // Needs the DOM (stylesheet + script srcs aren't in stored parsedData).
+      absorbResourceOccurrences(occurrences, parsedPages, baseUrl);
+
+      // PDF links come from parsed scalars.
+      for (const page of parsedPages) {
+        for (const link of page.parsed.links) {
+          if (!link.url) continue;
+          if (!link.url.toLowerCase().endsWith(".pdf")) continue;
+          try {
+            const linkOrigin = new URL(link.url).origin;
+            if (baseOrigin && linkOrigin === baseOrigin) {
+              const sources = occurrences.pdfs.get(link.url) ?? new Set<string>();
+              sources.add(page.url);
+              occurrences.pdfs.set(link.url, sources);
+            }
+          } catch {
+            // Skip malformed URLs
+          }
+        }
+      }
+    },
+  };
+}
+
 export function fetchResourceAssets(
   storage: CrawlStorage,
   crawlId: string,
@@ -522,36 +641,36 @@ export function fetchResourceAssets(
   overrides?: ResourceCheckOverrides,
 ): Effect.Effect<PreFetchedAssets, never, never> {
   return Effect.gen(function* () {
+    const crawl = yield* storage
+      .getCrawl(crawlId)
+      .pipe(Effect.catchAll(() => Effect.succeed(null)));
+    const collector = createSiteAssetCollector(crawl?.baseUrl ?? "");
+    collector.absorb(siteContext);
+    return yield* fetchAssetsFromOccurrences(
+      storage,
+      crawlId,
+      collector.occurrences,
+      config,
+      overrides,
+    );
+  });
+}
+
+/**
+ * The asset phase's network tail: sitemap coverage, then the bounded CSS /
+ * image / script / PDF / sitemap-status fetches. Split out of
+ * {@link fetchResourceAssets} (#1860) so the cloud can drive the collection half
+ * one page batch at a time and still land in exactly this code.
+ */
+export function fetchAssetsFromOccurrences(
+  storage: CrawlStorage,
+  crawlId: string,
+  occurrences: SiteAssetOccurrences,
+  config: Config,
+  overrides?: ResourceCheckOverrides,
+): Effect.Effect<PreFetchedAssets, never, never> {
+  return Effect.gen(function* () {
     const assetsSpan = logger.traceStart("fetchResourceAssets");
-
-    // Build parsedPages from siteContext (same filtering as runRulesOnStorage)
-    const parsedPages: Array<{
-      url: string;
-      finalUrl?: string;
-      statusCode: number;
-      parsed: ParsedPage;
-    }> = [];
-
-    for (const { page, parsed } of siteContext) {
-      if (!parsed) continue;
-      const wafChallenge = detectWafChallengePage({
-        status: page.status,
-        headers: {
-          server: page.headers.server,
-          cfCacheStatus: page.headers.cfCacheStatus,
-          xCache: page.headers.xCache,
-        },
-        html: page.html,
-      });
-      if (wafChallenge.detected) continue;
-
-      parsedPages.push({
-        url: page.normalizedUrl,
-        finalUrl: page.finalUrl,
-        statusCode: page.status,
-        parsed,
-      });
-    }
 
     const crawl = yield* storage
       .getCrawl(crawlId)
@@ -608,47 +727,24 @@ export function fetchResourceAssets(
       truncated: crawl?.stats?.sitemapDiscoveryTruncated ?? false,
     };
 
+    // Every orphan the coverage pass found, in its order. These are the
+    // sitemap-status check's CANDIDATES; what bounds them is `sitemapStatusLimit`
+    // below (the configured resource limit), not the report's array cap.
+    // Capping here instead silently stopped checking past REPORT_LIMITS.maxPages,
+    // so a 404 at orphan 2,001 of a 3,000-page crawl was never looked at and
+    // `crawl/sitemap-4xx` reported a pass (#1913). The cloud is unaffected: it
+    // passes resourceCheckMaxItems = 100.
+    let orphanCandidates: string[] = [];
     if (sitemapDiscovery.discovered.length > 0) {
-      const coverage = computeSitemapCoverageData(
-        parsedPages.map((page) => ({
-          url: page.url,
-          finalUrl: page.finalUrl,
-          statusCode: page.statusCode,
-        })),
-        sitemapDiscovery,
-      );
-      // Cap to keep resource-check URLs within reasonable bounds
+      const coverage = computeSitemapCoverageData(occurrences.coveragePages, sitemapDiscovery);
+      orphanCandidates = coverage.orphanPages;
+      // The arrays that TRAVEL stay capped at the schema's array limit.
       sitemapDiscovery.orphanPages = coverage.orphanPages.slice(0, REPORT_LIMITS.maxPages);
       sitemapDiscovery.missingPages = coverage.missingPages.slice(0, REPORT_LIMITS.maxPages);
     }
 
-    // Collect resource URLs from parsed pages
-    const resourceOccurrences = collectResourceOccurrences(parsedPages, baseUrl);
-
-    // Collect PDF URLs from parsed page links
-    const pdfUrls = new Map<string, Set<string>>();
-    let baseOrigin: string | null = null;
-    try {
-      baseOrigin = baseUrl ? new URL(baseUrl).origin : null;
-    } catch {
-      // ignore
-    }
-    for (const page of parsedPages) {
-      for (const link of page.parsed.links) {
-        if (!link.url) continue;
-        if (!link.url.toLowerCase().endsWith(".pdf")) continue;
-        try {
-          const linkOrigin = new URL(link.url).origin;
-          if (baseOrigin && linkOrigin === baseOrigin) {
-            const sources = pdfUrls.get(link.url) ?? new Set<string>();
-            sources.add(page.url);
-            pdfUrls.set(link.url, sources);
-          }
-        } catch {
-          // Skip malformed URLs
-        }
-      }
-    }
+    const resourceOccurrences = occurrences;
+    const pdfUrls = occurrences.pdfs;
 
     // Prior-crawl sub-resource records, keyed by URL, enable browser-like cache
     // reuse for CSS/images (#107). Empty on a first/cold audit. Mirrors the page
@@ -701,7 +797,7 @@ export function fetchResourceAssets(
     };
 
     const scriptFetchOptions: Parameters<typeof fetchScriptContents>[1] = {
-      pageCount: siteContext.length,
+      pageCount: occurrences.pageCount,
       ...(maxResources != null ? { maxScripts: maxResources } : {}),
       ...(overrides?.resourceCheckTimeoutMs != null
         ? { timeoutMs: overrides.resourceCheckTimeoutMs }
@@ -713,7 +809,7 @@ export function fetchResourceAssets(
     };
 
     const sitemapStatusLimit = Math.min(
-      sitemapDiscovery.orphanPages.length,
+      orphanCandidates.length,
       maxResources ?? config.crawler?.max_pages ?? 500,
     );
 
@@ -743,7 +839,7 @@ export function fetchResourceAssets(
           resourceCheckOptions,
         ),
         sitemap: checkResourceSizes(
-          sitemapDiscovery.orphanPages.slice(0, sitemapStatusLimit),
+          orphanCandidates.slice(0, sitemapStatusLimit),
           resourceCheckOptions,
         ),
       },
@@ -1564,6 +1660,22 @@ type StreamParsedPage = {
   redirectChain?: RedirectChain;
 };
 
+/**
+ * The per-page identity the streamed universe retains, in place of the whole
+ * {@link PageRecord}. Deliberately just the three scalars the post-Pass-1 steps
+ * read (`buildStreamingSiteData`'s soft-404 confirm pass), because a PageRecord
+ * carries `html` (≈1 MB on a script-heavy page) and `parsedData` — keeping one
+ * per page put the O(pages × html) term straight back into a pipeline whose
+ * whole point is bounding residency (#1860). `parsed` is the SAME object the
+ * matching `parsedPages` entry holds, so it costs nothing extra.
+ */
+interface StreamPageIdentity {
+  normalizedUrl: string;
+  status: number;
+  fetcherId?: string | null;
+  parsed: ParsedPage;
+}
+
 interface ParsedUniverse {
   parsedPages: StreamParsedPage[];
   wafBlockedPages: Array<{ url: string; provider: string | null }>;
@@ -1571,91 +1683,147 @@ interface ParsedUniverse {
   /** Pages excluded from scoring because the host was throttling (#1829). */
   rateLimitedPages: Array<{ url: string; status: number }>;
   rateLimitedPageSet: Set<string>;
-  pageDataMap: Map<
-    string,
-    { page: PageRecord; parsed: ParsedPage; headers: Record<string, string> }
-  >;
+  pageDataMap: Map<string, StreamPageIdentity>;
 }
 
 /**
- * Assemble the `site.pages` universe from a parsed site context, EXACTLY as
- * `runRulesOnStorage` does: HTML pages first (WAF-challenge pages excluded and
- * collected for the advisory site check), then 4xx/5xx error pages appended with
+ * Assemble the `site.pages` universe, EXACTLY as `runRulesOnStorage` does: HTML
+ * pages first (WAF-challenge and rate-limited pages excluded and collected for
+ * their advisory site checks), then 4xx/5xx error pages appended with
  * `EMPTY_PARSED_PAGE`. Reads only `page.html` + parsed scalars (never
  * `parsed.document`), so a DOM-dropped context yields the same universe — which
- * is what lets Pass 1 null each batch's DOMs before calling this. Duplicated from
- * v1's inline block to keep v1 untouched; the golden-diff gates against drift.
+ * is what lets Pass 1 null each batch's DOMs before feeding it here.
+ *
+ * Batch-absorbing (`absorb` per batch, then one `build`) rather than taking the
+ * whole site context, so Pass 1 never has to hold every `PageRecord` resident
+ * just to assemble the universe. Order is preserved because HTML and error
+ * entries are buffered separately and concatenated once, and the error-page
+ * `!pageDataMap.has` test is deferred to `build`, where the map is complete —
+ * the two places batching could otherwise diverge from v1's two-loop original.
+ * Duplicated from v1's inline block to keep v1 untouched; the golden-diff gates
+ * against drift.
  */
-function assembleParsedUniverse(siteContext: SiteContextPage[]): ParsedUniverse {
-  const parsedPages: StreamParsedPage[] = [];
+function createParsedUniverseAccumulator(): {
+  absorb: (siteContext: SiteContextPage[]) => void;
+  build: () => ParsedUniverse;
+} {
+  const htmlPages: StreamParsedPage[] = [];
+  // v1 appends its 4xx/5xx entries AFTER every HTML page, so they are buffered
+  // separately and concatenated in `build` — which is what makes absorbing the
+  // crawl one batch at a time produce v1's exact `site.pages` order.
+  const errorPages: StreamParsedPage[] = [];
   const wafBlockedPages: Array<{ url: string; provider: string | null }> = [];
   const wafBlockedPageSet = new Set<string>();
   const rateLimitedPages: Array<{ url: string; status: number }> = [];
   const rateLimitedPageSet = new Set<string>();
   const pageDataMap: ParsedUniverse["pageDataMap"] = new Map();
-
-  for (const { page, parsed } of siteContext) {
-    if (!parsed) continue; // non-HTML / failed parse — v1 skips these too
-    // Mirrors v1's rate-limit exclusion (#1829); the golden diff gates drift.
-    if (isRateLimitStatus(page.status)) {
-      rateLimitedPages.push({ url: page.normalizedUrl, status: page.status });
-      rateLimitedPageSet.add(page.normalizedUrl);
-      continue;
-    }
-    const wafChallenge = detectWafChallengePage({
-      status: page.status,
-      headers: {
-        server: page.headers.server,
-        cfCacheStatus: page.headers.cfCacheStatus,
-        xCache: page.headers.xCache,
-      },
-      html: page.html,
-    });
-    if (wafChallenge.detected) {
-      wafBlockedPages.push({ url: page.normalizedUrl, provider: wafChallenge.provider });
-      wafBlockedPageSet.add(page.normalizedUrl);
-      continue;
-    }
-
-    const headers = buildHeadersMap(page);
-    parsedPages.push({
-      url: page.normalizedUrl,
-      finalUrl: page.finalUrl,
-      statusCode: page.status,
-      parsed,
-      headers,
-      redirectChain: page.redirectChain,
-    });
-    pageDataMap.set(page.normalizedUrl, { page, parsed, headers });
-  }
-
-  // Error pages (4xx/5xx) carry no HTML but their status codes feed broken-link
-  // detection — appended after the HTML pages exactly as v1 does.
-  for (const { page } of siteContext) {
-    if (
-      page.status >= 400 &&
-      !pageDataMap.has(page.normalizedUrl) &&
-      !wafBlockedPageSet.has(page.normalizedUrl) &&
-      !rateLimitedPageSet.has(page.normalizedUrl)
-    ) {
-      parsedPages.push({
-        url: page.normalizedUrl,
-        finalUrl: page.finalUrl,
-        statusCode: page.status,
-        parsed: EMPTY_PARSED_PAGE,
-        headers: {},
-        redirectChain: page.redirectChain,
-      });
-    }
-  }
+  // v1's second loop tests `!pageDataMap.has(url)` against the map as it stands
+  // AFTER the whole first loop. Batching means a later batch can still add to
+  // that map, so the error-page decision is deferred to `build`.
+  const errorCandidates: StreamParsedPage[] = [];
 
   return {
-    parsedPages,
-    wafBlockedPages,
-    wafBlockedPageSet,
-    rateLimitedPages,
-    rateLimitedPageSet,
-    pageDataMap,
+    absorb(siteContext: SiteContextPage[]): void {
+      for (const { page, parsed } of siteContext) {
+        // Error-page candidates are collected for EVERY page (parsed or not),
+        // mirroring v1's second loop, which iterates the whole site context.
+        if (page.status >= 400) {
+          errorCandidates.push({
+            url: page.normalizedUrl,
+            finalUrl: page.finalUrl,
+            statusCode: page.status,
+            parsed: EMPTY_PARSED_PAGE,
+            headers: {},
+            redirectChain: page.redirectChain,
+          });
+        }
+
+        if (!parsed) continue; // non-HTML / failed parse — v1 skips these too
+        // Mirrors v1's rate-limit exclusion (#1829); the golden diff gates drift.
+        if (isRateLimitStatus(page.status)) {
+          rateLimitedPages.push({ url: page.normalizedUrl, status: page.status });
+          rateLimitedPageSet.add(page.normalizedUrl);
+          continue;
+        }
+        const wafChallenge = detectWafChallengePage({
+          status: page.status,
+          headers: {
+            server: page.headers.server,
+            cfCacheStatus: page.headers.cfCacheStatus,
+            xCache: page.headers.xCache,
+          },
+          html: page.html,
+        });
+        if (wafChallenge.detected) {
+          wafBlockedPages.push({ url: page.normalizedUrl, provider: wafChallenge.provider });
+          wafBlockedPageSet.add(page.normalizedUrl);
+          continue;
+        }
+
+        // Drop the page's extracted TEXT before retaining the parse (#1860).
+        //
+        // This is the single largest thing the streamed universe holds: measured
+        // over a 509-page crawl of ~1 MB pages, the retained ParsedPage set is
+        // 40.5 KB per page and `content.textContent` is 39.1 KB of it — 97%.
+        // Nothing that reads this universe wants it. Site rules take their text
+        // from `ctx.collectedSignals` or from their own DOM walk; the four rules
+        // that do read `content.textContent` read it off `ctx.parsed`, the PAGE
+        // context, which Pass 2 re-parses fresh; and the report's summary and
+        // page audits read only meta/og/twitter/schema/h1 and the `isThinContent`
+        // flag, all of which survive. Every other `content` field is kept.
+        //
+        // The golden diff is the check on that reasoning: a site rule that did
+        // read this text would produce different findings than v1 and fail.
+        if (parsed.content?.textContent) parsed.content.textContent = "";
+
+        // Detach BEFORE retaining (#1860). A parse that ran against a live DOM
+        // hands back scalars that are slices of the page's HTML, and the
+        // universe outlives every batch, so one retained href holds a whole
+        // 959 KB page for the rest of the run. Cloned once and shared by both
+        // consumers below — `runSitePass`'s soft-404 confirm mutates the parse
+        // through `pageDataMap` and `parsedPages` has to see that mutation.
+        const kept = detachParsedPage(parsed);
+
+        const headers = buildHeadersMap(page);
+        htmlPages.push({
+          url: page.normalizedUrl,
+          finalUrl: page.finalUrl,
+          statusCode: page.status,
+          parsed: kept,
+          headers,
+          redirectChain: page.redirectChain,
+        });
+        // Scalars only — NOT the PageRecord (see StreamPageIdentity).
+        pageDataMap.set(page.normalizedUrl, {
+          normalizedUrl: page.normalizedUrl,
+          status: page.status,
+          fetcherId: page.fetcherId,
+          parsed: kept,
+        });
+      }
+    },
+
+    build(): ParsedUniverse {
+      // Error pages (4xx/5xx) carry no HTML but their status codes feed
+      // broken-link detection — appended after the HTML pages exactly as v1 does.
+      for (const candidate of errorCandidates) {
+        if (
+          !pageDataMap.has(candidate.url) &&
+          !wafBlockedPageSet.has(candidate.url) &&
+          !rateLimitedPageSet.has(candidate.url)
+        ) {
+          errorPages.push(candidate);
+        }
+      }
+      return {
+        parsedPages: [...htmlPages, ...errorPages],
+        wafBlockedPages,
+        wafBlockedPageSet,
+        rateLimitedPages,
+        rateLimitedPageSet,
+        pageDataMap,
+      };
+    },
   };
 }
 
@@ -1672,7 +1840,7 @@ function streamParsedUniverse(
   batchSize: number,
 ): Effect.Effect<ParsedUniverse & { totalPageCount: number }, never, never> {
   return Effect.gen(function* () {
-    const siteContext: SiteContextPage[] = [];
+    const universe = createParsedUniverseAccumulator();
     let totalPageCount = 0;
 
     for (let offset = 0; ; offset += batchSize) {
@@ -1684,15 +1852,19 @@ function streamParsedUniverse(
       totalPageCount += batch.length;
 
       const ctx = yield* buildSiteContext(batch);
-      // Drop this batch's DOMs before the next — `assembleParsedUniverse` and the
-      // site-fetch phase read only page.html + parsed scalars, never `.document`.
+      // Absorb THEN drop, and never retain `ctx` past the iteration: the
+      // accumulator keeps only parsed scalars, so this batch's PageRecords (each
+      // holding the page's full html) become garbage at the end of the loop body.
+      // Absorbing before the release is safe — the universe reads page.html for
+      // WAF detection but never `parsed.document`.
+      universe.absorb(ctx);
       releaseSiteContextDocuments(ctx);
-      for (const entry of ctx) siteContext.push(entry);
+      collectDroppedBatch();
 
       if (batch.length < batchSize) break;
     }
 
-    return { ...assembleParsedUniverse(siteContext), totalPageCount };
+    return { ...universe.build(), totalPageCount };
   });
 }
 
@@ -1871,10 +2043,10 @@ function buildStreamingSiteData(
     // flagged candidates; a failed/absent re-fetch degrades to `unconfirmed`.
     yield* Effect.promise(() =>
       confirmSoft404Candidates(
-        Array.from(pageDataMap.values(), ({ page, parsed }) => ({
+        Array.from(pageDataMap.values(), (page) => ({
           url: page.normalizedUrl,
           statusCode: page.status,
-          parsed,
+          parsed: page.parsed,
           rendered: isRenderedFetch(page.fetcherId),
         })),
         {
@@ -1943,6 +2115,7 @@ function runSitePass(
   siteData: SiteData,
   assets: PreFetchedAssets,
   wafBlockedPages: ReadonlyArray<{ url: string; provider: string | null }>,
+  rateLimitedPages: ReadonlyArray<{ url: string; status: number }>,
   collectedSignals: CollectedSiteSignals,
   siteQuery: SiteQuery,
 ): Effect.Effect<
@@ -2014,6 +2187,50 @@ function runSitePass(
       siteRuleRunResults.set(wafRuleResult.meta.id, wafRuleResult);
     }
 
+    // #1829, verbatim from runRulesOnStorage and in v1's position (after the WAF
+    // notice, before the asset-degradation note). This was MISSING from the
+    // streaming twin: #1829 landed after the #1021 golden gate was written and
+    // the golden fixtures carry no 429/430 pages, so the gate never caught it —
+    // a throttled cloud crawl silently lost the advisory on this path.
+    if (rateLimitedPages.length > 0) {
+      const sampledPages = rateLimitedPages.slice(0, 5).map((page) => page.url);
+      const statuses = Array.from(new Set(rateLimitedPages.map((page) => page.status))).sort(
+        (a, b) => a - b,
+      );
+
+      const rateLimitCheck: CheckResult = {
+        name: "Rate-limited pages",
+        status: "info",
+        message: `${rateLimitedPages.length} page(s) were rate limited (${statuses.join(", ")}); their status is unverified and they were excluded from page-level rule scoring.`,
+        pages: sampledPages,
+        details: {
+          totalRateLimitedPages: rateLimitedPages.length,
+          statuses,
+          sampledPages,
+        },
+      };
+
+      const rateLimitRuleResult: RuleRunResult = {
+        meta: {
+          id: "crawl/rate-limited-pages",
+          name: "Rate-Limited Pages",
+          description:
+            "Pages the origin answered with rate limiting (429/430), so their real status could not be verified.",
+          solution:
+            "Slow the crawl down for this host: set `[crawler] per_host_concurrency = 1` and `per_host_delay_ms = 500` in squirrel.toml, and raise `max_backoff_ms` if the host needs longer recovery windows.",
+          category: "crawl",
+          scope: "site",
+          severity: "info",
+          weight: 0,
+        },
+        checks: [rateLimitCheck],
+      };
+
+      siteResult.checks.push(rateLimitCheck);
+      siteRuleResults.set(rateLimitRuleResult.meta.id, [rateLimitCheck]);
+      siteRuleRunResults.set(rateLimitRuleResult.meta.id, rateLimitRuleResult);
+    }
+
     if (assets.degradation?.degraded) {
       const d = assets.degradation;
       const hostText =
@@ -2058,6 +2275,25 @@ function runSitePass(
   });
 }
 
+/**
+ * The sub-phases of {@link runStreamingRules}, in execution order. Named so a
+ * memory or wall-clock step can be attributed to one of them instead of to
+ * "rules" as a whole (#1860).
+ */
+export type StreamingRulePhase =
+  /** Pass 1: the streamed DOM-free scalar universe. */
+  | "universe"
+  /** Steps 2+3: robots/sitemaps/links/cloaking/soft-404, plus siteData assembly. */
+  | "site-fetch"
+  /** Pass 2: the streamed page-rule loop (this one already heartbeats per N pages). */
+  | "page-rules"
+  /** The bounded aggregate view over the crawl (incoming links, page_features). */
+  | "site-query"
+  /** The site-rule pass over the DOM-free universe + collected signals. */
+  | "site-rules"
+  /** Merging + folding the site results and building the report's parsed cache. */
+  | "assemble";
+
 /** {@link runStreamingRules} result: the v1 {@link RuleExecutionResult} plus the folded per-rule tallies and the page-stream DOM-residency high-water mark. */
 export interface StreamingRuleExecutionResult extends RuleExecutionResult {
   /**
@@ -2099,10 +2335,42 @@ export function runStreamingRules(
     batchSize?: number;
     hooks?: StreamPageRulesHooks;
     signal?: AbortSignal;
+    /**
+     * #1252 page-loop hooks, forwarded to {@link streamPageRules}. The cloud
+     * passes them so the sync page-rule CPU yields to the event loop and emits a
+     * progress marker every N pages; omitted → byte-identical local behavior.
+     */
+    pageLoopHooks?: PageRuleLoopHooks;
+    /**
+     * Sub-phase boundaries inside the rules pass (#1860).
+     *
+     * The pass emits nothing between "rules started" and "rules completed", and a
+     * production run at 150 pages showed two ~1 GB steps hiding in exactly those
+     * gaps — one before the first page heartbeat, one after the last — which the
+     * event stream could not attribute to anything. Callers hook this to sample
+     * RSS (or time) per sub-phase. The engine deliberately does not sample
+     * anything itself: `process` is the caller's concern.
+     */
+    onPhase?: (phase: StreamingRulePhase, boundary: "start" | "end") => void;
+    /**
+     * Template fan-out (#1951), forwarded to {@link streamPageRules}. Omitted →
+     * the env default (ON, `SQUIRREL_TEMPLATE_FANOUT=0` to kill it). Benches and
+     * the equivalence test set it explicitly to run both arms in one process.
+     */
+    templateFanout?: boolean;
   },
 ): Effect.Effect<StreamingRuleExecutionResult, never, never> {
   return Effect.gen(function* () {
-    const batchSize = opts?.batchSize ?? STREAM_PAGE_BATCH;
+    // Clamped — see streaming.ts; a 0 batch would loop forever over the crawl.
+    const batchSize = Math.max(1, opts?.batchSize ?? STREAM_PAGE_BATCH);
+    const onPhase = opts?.onPhase;
+    const phase = <T,>(name: StreamingRulePhase, body: () => Effect.Effect<T, never, never>) =>
+      Effect.gen(function* () {
+        onPhase?.(name, "start");
+        const out = yield* body();
+        onPhase?.(name, "end");
+        return out;
+      });
 
     // Threat-intel scope + runner (mirror of runRulesOnStorage).
     const effectiveScope =
@@ -2110,18 +2378,20 @@ export function runStreamingRules(
     const runner = createRunner(config, effectiveScope);
 
     // Pass 1: DOM-free scalar universe (one batch of DOMs live at a time).
-    const { parsedPages, pageDataMap, totalPageCount, wafBlockedPages } =
-      yield* streamParsedUniverse(storage, crawlId, batchSize);
+    const { parsedPages, pageDataMap, totalPageCount, wafBlockedPages, rateLimitedPages } =
+      yield* phase("universe", () => streamParsedUniverse(storage, crawlId, batchSize));
 
     // Steps 2+3: site-fetch phase + soft-404 verdict map.
-    const { siteDataForPageRules, soft404Map } = yield* buildStreamingSiteData(
-      storage,
-      crawlId,
-      config,
-      assets,
-      parsedPages,
-      pageDataMap,
-      totalPageCount,
+    const { siteDataForPageRules, soft404Map } = yield* phase("site-fetch", () =>
+      buildStreamingSiteData(
+        storage,
+        crawlId,
+        config,
+        assets,
+        parsedPages,
+        pageDataMap,
+        totalPageCount,
+      ),
     );
 
     // Pass 2: streamed page-rule pass — per-page DOM-drop, merge + fold. The
@@ -2132,19 +2402,40 @@ export function runStreamingRules(
     const collectedPages: CollectedPageSignal[] = [];
     const signalCollector: PageSignalCollector = {
       id: "site-dom-signals",
-      collect(page, parsed) {
+      collect(page, parsed, shared) {
         collectedPages.push(
-          buildCollectedPageSignal({ url: page.normalizedUrl, finalUrl: page.finalUrl, parsed }),
+          detachFromPage(
+            // `shared.fingerprint` is the one the loop already built for
+            // page_features' cluster key (#1949) — reusing it keeps this pass at
+            // one DOM walk per page. detachFromPage clones it, so the signal this
+            // array retains does not hold the loop's copy or its page.
+            buildCollectedPageSignal({
+              url: page.normalizedUrl,
+              finalUrl: page.finalUrl,
+              parsed,
+              fingerprint: shared.fingerprint,
+            }),
+            "collected-signal",
+          ),
         );
       },
     };
-    const streamed = yield* streamPageRules(storage, crawlId, runner, siteDataForPageRules, {
+    const streamed = yield* phase("page-rules", () =>
+      streamPageRules(storage, crawlId, runner, siteDataForPageRules, {
       batchSize,
       soft404Confirmations: soft404Map,
       collectors: [signalCollector],
       hooks: opts?.hooks,
       signal: opts?.signal,
-    });
+      // v1's page-rule universe verbatim (its `pageDataMap` keys), so the streamed
+      // pass can't drift from it — notably it excludes rate-limited pages, which
+      // `isAuditablePage` alone does not (#1829).
+      pageUniverse: new Set(pageDataMap.keys()),
+      totalPages: pageDataMap.size,
+      pageLoopHooks: opts?.pageLoopHooks,
+      templateFanout: opts?.templateFanout,
+      }),
+    );
     const collectedSignals: CollectedSiteSignals = { pages: collectedPages };
 
     // Bounded, read-only aggregate view over the crawl (#1022): the site pass's
@@ -2155,34 +2446,51 @@ export function runStreamingRules(
     // failure is a hard error, not a silent empty view (matches the streaming reads).
     // `universe` = v1's assembled site.pages order (parsedPages) so the incoming-link
     // graph's membership/order/sources match v1 exactly (E-E2 (b) reconciliation).
-    const siteQuery = yield* createSiteQuery(storage, crawlId, {
-      universe: parsedPages.map((p) => p.url),
-    }).pipe(Effect.orDie);
+    const siteQuery = yield* phase("site-query", () =>
+      createSiteQuery(storage, crawlId, {
+        universe: parsedPages.map((p) => p.url),
+        pageScanBatchSize: batchSize,
+      }).pipe(Effect.orDie),
+    );
 
     // Step 5: site pass over the DOM-free scalar universe (no re-materialization).
-    const sitePass = yield* runSitePass(
-      runner,
-      siteDataForPageRules,
-      assets,
-      wafBlockedPages,
-      collectedSignals,
-      siteQuery,
+    const sitePass = yield* phase("site-rules", () =>
+      runSitePass(
+        runner,
+        siteDataForPageRules,
+        assets,
+        wafBlockedPages,
+        rateLimitedPages,
+        collectedSignals,
+        siteQuery,
+      ),
     );
 
     // Step 6: assemble. Page rules were already merged + folded by streamPageRules;
     // merge + fold the site rules on top so ruleResultsMap and tallies stay in
     // lockstep — calculateHealthScoreFromTallies(tallies) === calculateHealthScore(ruleResultsMap).
-    const ruleResultsMap = streamed.ruleResultsMap;
-    const tallies = streamed.tallies;
-    for (const [ruleId, rr] of sitePass.siteRuleRunResults) {
-      mergeRuleRunResult(ruleResultsMap, ruleId, rr);
-      foldRuleResultIntoTallies(tallies, ruleId, rr);
-    }
+    //
+    // Reported as a phase like the rest: this is where the report's parsed-page
+    // cache is built, which is one of the structures that still scales with page
+    // count, so it is exactly the step whose cost we want visible when deciding
+    // whether to bound it. It was the one declared phase the pass never emitted.
+    const { ruleResultsMap, tallies, parsedPagesCache } = yield* phase("assemble", () =>
+      Effect.sync(() => {
+        const map = streamed.ruleResultsMap;
+        const folded = streamed.tallies;
+        for (const [ruleId, rr] of sitePass.siteRuleRunResults) {
+          mergeRuleRunResult(map, ruleId, rr);
+          foldRuleResultIntoTallies(folded, ruleId, rr);
+        }
 
-    // Parsed-page cache for the report tail — same universe (auditable pages) v1
-    // returns, with DOMs already dropped (report reads only extracted fields).
-    const parsedPagesCache = new Map<string, ParsedPage>();
-    for (const [url, { parsed }] of pageDataMap) parsedPagesCache.set(url, parsed);
+        // Parsed-page cache for the report tail — same universe (auditable pages)
+        // v1 returns, with DOMs already dropped (report reads only extracted
+        // fields).
+        const cache = new Map<string, ParsedPage>();
+        for (const [url, { parsed }] of pageDataMap) cache.set(url, parsed);
+        return { ruleResultsMap: map, tallies: folded, parsedPagesCache: cache };
+      }),
+    );
 
     return {
       pageResults: streamed.pageResults,
@@ -2208,7 +2516,9 @@ export function runStreamingRules(
 // "./adapter") and every existing "./adapter" importer stay byte-identical.
 export {
   emptyRuleExecutionResult,
+  V1_REPORT_PAGE_BATCH,
   type AuditSummary,
+  type BuildV1ReportOptions,
   type FullAuditReport,
   type PageAudit,
   type RuleExecutionResult,
@@ -2225,8 +2535,9 @@ export function generateReportFromStorage(
   storage: CrawlStorage,
   crawlId: string,
   ruleResults: RuleExecutionResult,
+  options?: BuildV1ReportOptions,
 ): Effect.Effect<FullAuditReport, never, never> {
-  return buildV1Report(storage, crawlId, ruleResults);
+  return buildV1Report(storage, crawlId, ruleResults, options);
 }
 
 // ============================================
@@ -2247,6 +2558,85 @@ export interface ExternalLinkCheckProgress {
  * @param linkCache - Optional injectable link cache (CLI provides SQLite-backed; cloud passes null)
  * @param bulkChecker - Optional cloud bulk checker (paid dead_links service), tried first per url
  */
+interface ExternalLinkOccurrence {
+  pageUrl: string;
+  text: string;
+  position: LinkPosition;
+  isNofollow: boolean;
+}
+
+/** Per-href external-link appearances, accumulated across page batches. */
+export type ExternalLinkOccurrences = Map<string, ExternalLinkOccurrence[]>;
+
+/**
+ * Collect one batch's external-link appearances into `target`. MUST be called
+ * with the batch's DOMs live: link POSITION (nav/header/footer/body) is not in
+ * stored parsedData, so this is the one pre-rules step that genuinely needs a
+ * parsed document per page. Split out of {@link checkExternalLinksOnStorage}
+ * (#1860) so the cloud can accumulate over batches instead of holding every
+ * page's DOM resident to make one pass.
+ *
+ * The appearances are DETACHED before they land in `target`, for the same
+ * reason the page-rule findings are (#1860). `href` and `text` are read off the
+ * batch's live DOM, so both are slices of that page's html, and JSC keeps a
+ * slice attached to the buffer it came from. `target` outlives every batch, so
+ * one retained anchor text holds its whole page as UTF-16 until the walk ends —
+ * including the map KEY, which pins a page just as effectively as a value.
+ *
+ * Measured by scripts/prerules-retention.ts over real 959 KB pages with
+ * per-page-distinct external links, batch 50, against a control that absorbs
+ * nothing. String backing store held above the control:
+ *
+ *          50 pages   100 pages   150 pages
+ *   before    0 MB       94 MB      187 MB
+ *   after     3 MB        0 MB       -1 MB
+ *
+ * 1.87 MB per page, which is one 959 KB page as UTF-16 — every page walked,
+ * pinned whole, for ~200 KB of actual link data. It reads as zero at 50 pages
+ * because that is one batch: the retention only shows once a pinned page is one
+ * the walk has already moved past.
+ */
+export function absorbExternalLinkOccurrences(
+  target: ExternalLinkOccurrences,
+  siteContext: SiteContextPage[],
+): void {
+  // Collected for THIS call first so the whole batch is detached in ONE
+  // structuredClone. Cloning per link would be the same detach at many times
+  // the per-call cost, and a link-heavy crawl absorbs tens of thousands.
+  const fresh: Array<{ href: string; occurrence: ExternalLinkOccurrence }> = [];
+
+  for (const { page, parsed } of siteContext) {
+    if (!parsed || !parsed.document) continue; // Skip non-HTML or failed parses
+
+    // Extract links from pre-parsed document (no additional parsing)
+    // We need position info which isn't stored in parsedData
+    const links = extractLinks(parsed.document, page.finalUrl);
+
+    for (const link of links) {
+      if (!link.isInternal && link.href) {
+        fresh.push({
+          href: link.href,
+          occurrence: {
+            pageUrl: page.normalizedUrl,
+            text: link.text,
+            position: link.position,
+            isNofollow: link.isNofollow,
+          },
+        });
+      }
+    }
+  }
+
+  // Merged in absorption order, so `target` ends up with exactly the entries and
+  // per-href order the attached version produced. String map keys compare by
+  // value, so a detached href still finds an entry an earlier batch stored.
+  for (const { href, occurrence } of detachFromPage(fresh, "external-links")) {
+    const occurrences = target.get(href) ?? [];
+    occurrences.push(occurrence);
+    target.set(href, occurrences);
+  }
+}
+
 export function checkExternalLinksOnStorage(
   storage: CrawlStorage,
   crawlId: string,
@@ -2256,39 +2646,38 @@ export function checkExternalLinksOnStorage(
   linkCache?: LinkCache | null,
   bulkChecker?: (urls: string[]) => Promise<Map<string, ExternalCheckResult>>,
 ): Effect.Effect<ExternalCheckResult[], never, never> {
+  if (!config.enabled) return Effect.succeed([]);
+  const externalLinkOccurrences: ExternalLinkOccurrences = new Map();
+  absorbExternalLinkOccurrences(externalLinkOccurrences, siteContext);
+  return checkCollectedExternalLinks(
+    storage,
+    crawlId,
+    externalLinkOccurrences,
+    config,
+    onProgress,
+    linkCache,
+    bulkChecker,
+  );
+}
+
+/**
+ * The external-link phase's network + persistence tail, over occurrences already
+ * collected by {@link absorbExternalLinkOccurrences}. Same body
+ * {@link checkExternalLinksOnStorage} always ran; split so both the resident and
+ * the streamed collection paths land here (#1860).
+ */
+export function checkCollectedExternalLinks(
+  storage: CrawlStorage,
+  crawlId: string,
+  externalLinkOccurrences: ExternalLinkOccurrences,
+  config: ExternalLinksConfig,
+  onProgress?: (progress: ExternalLinkCheckProgress) => void,
+  linkCache?: LinkCache | null,
+  bulkChecker?: (urls: string[]) => Promise<Map<string, ExternalCheckResult>>,
+): Effect.Effect<ExternalCheckResult[], never, never> {
   return Effect.gen(function* () {
     if (!config.enabled) {
       return [];
-    }
-
-    // Extract all external links from site context (no DOM parsing needed)
-    interface ExternalLinkOccurrence {
-      pageUrl: string;
-      text: string;
-      position: LinkPosition;
-      isNofollow: boolean;
-    }
-    const externalLinkOccurrences = new Map<string, ExternalLinkOccurrence[]>();
-
-    for (const { page, parsed } of siteContext) {
-      if (!parsed || !parsed.document) continue; // Skip non-HTML or failed parses
-
-      // Extract links from pre-parsed document (no additional parsing)
-      // We need position info which isn't stored in parsedData
-      const links = extractLinks(parsed.document, page.finalUrl);
-
-      for (const link of links) {
-        if (!link.isInternal && link.href) {
-          const occurrences = externalLinkOccurrences.get(link.href) ?? [];
-          occurrences.push({
-            pageUrl: page.normalizedUrl,
-            text: link.text,
-            position: link.position,
-            isNofollow: link.isNofollow,
-          });
-          externalLinkOccurrences.set(link.href, occurrences);
-        }
-      }
     }
 
     if (externalLinkOccurrences.size === 0) {
@@ -2384,10 +2773,29 @@ function collectResourceOccurrences(
   }>,
   baseUrl: string,
 ): ResourceOccurrenceMap {
+  const target: ResourceOccurrenceMap = {
+    css: new Map<string, Set<string>>(),
+    images: new Map<string, Set<string>>(),
+    scripts: new Map<string, Set<string>>(),
+  };
+  absorbResourceOccurrences(target, pages, baseUrl);
+  return target;
+}
+
+/** {@link collectResourceOccurrences}' body, accumulating into `target` so the
+ * streamed pre-rules pass can feed it one page batch at a time (DOMs live) and
+ * the whole-array entry point stays a one-shot call into the same code. */
+function absorbResourceOccurrences(
+  target: ResourceOccurrenceMap,
+  pages: Array<{
+    url: string;
+    finalUrl?: string;
+    parsed: ParsedPage;
+  }>,
+  baseUrl: string,
+): void {
   const baseHost = getHostname(baseUrl).toLowerCase();
-  const css = new Map<string, Set<string>>();
-  const images = new Map<string, Set<string>>();
-  const scripts = new Map<string, Set<string>>();
+  const { css, images, scripts } = target;
 
   for (const page of pages) {
     const pageUrl = page.finalUrl ?? page.url;
@@ -2427,8 +2835,6 @@ function collectResourceOccurrences(
       scripts.set(script.src, sources);
     }
   }
-
-  return { css, images, scripts };
 }
 
 function computeSitemapCoverageData(

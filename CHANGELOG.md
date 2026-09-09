@@ -12,13 +12,254 @@ How it works:
   A stable `## vX.Y.Z` matches any `## vX.Y.Z-<suffix>` heading (e.g. `-beta.N`,
   `-rc.1`), so a stable cut can reuse a pre-release section when no plain one exists.
 - Use `###` (or deeper) for sub-sections within an entry — a `## ` heading marks a new version.
-- A `## [Unreleased]` heading also ends a section (keep-a-changelog style); it's never extracted as a release body.
-- If no matching section exists, the release still ships with a minimal body — you can
-  refine it any time with `gh release edit "vX.Y.Z" --repo squirrelscan/squirrelscan --notes-file notes.md`.
-- Keep it public-facing: user-visible CLI/rules/reliability changes only — no internal refs.
+- A `## [Unreleased]` section collects merged changes that have not been cut into
+  a release yet; rename it to the version when the release goes out.
 
-Earlier releases (v0.0.56 and prior) are on the
-[GitHub releases page](https://github.com/squirrelscan/squirrelscan/releases).
+## [Unreleased]
+
+### Fixed
+
+- `squirrel self update` now checks that the binary your PATH resolves is the one
+  it just installed, and says so when it isn't. It used to flip the symlink
+  recorded at install time and report success on that alone, so a stale
+  `install_bin_dir` (or a second `squirrel` earlier on PATH) left you running the
+  old version after every "Updated to vX". A recorded bin directory that no longer
+  exists is now dropped, and the update falls back to the default one. #293
+- `squirrel self doctor` gained an Install location check: the recorded
+  `install_bin_dir`, the link and the release version it points at, and the
+  `squirrel` your PATH actually resolves, with a warning when they disagree. #293
+
+## v0.0.92
+
+A release about running again. v0.0.91 made a big audit fit in memory; this
+one makes the second audit of the same site cheaper than the first, lets a
+local audit crawl 10,000 pages, and cuts the rules pass on script-heavy pages
+by 40%. It also adds the disk tooling a project database needs once audits
+accumulate, and fixes the CLI minting API keys against the wrong organization
+for accounts with more than one.
+
+### By the numbers
+
+Every figure is from the checked-in record in
+`benchmarks/2026-09-perf-program.md`. Laptop rows are a cold `squirrel audit
+--coverage full`, heap sampled after a forced collection at exit.
+
+| | v0.0.91 | v0.0.92 |
+|---|---|---|
+| 2,500-page audit, wall time | 502 s | 177 s |
+| 2,500-page audit, retained heap | 3,902 MB | 996 MB |
+| 1,000-page audit, wall time | 194 s | 128 s |
+| 1,000-page audit, retained heap | 1,662 MB | 565 MB |
+| Largest local audit | 5,000 pages | 10,000 pages in 12 min, 5.4 GB peak RSS |
+| SQL statements compiled on a warm 120-page re-crawl | 1,482 | 48 |
+| Rules pass on a 1 MB script-heavy page | 274 ms | 165 ms |
+| Page-rule CPU on a templated site (25 template-scoped rules) | | 13% less |
+| Report assembly at 1,000 pages, peak memory | | about 150 MB less |
+| Hosted publish merge carrying 60,000 prior findings | 330 MB | under 100 MB |
+| Hosted re-audit of an unchanged 150-page site | 115 pages rendered | 17 rendered, report byte-identical |
+| Project database after six audits of a 40-page site | 14.7 MB | 11.9 MB |
+
+### Added
+
+- **`squirrel self disk` shows where `~/.squirrel` goes, and `--prune` gets it
+  back.** Every audit keeps its full history in the project database, so a
+  re-audited site grows by roughly one audit per run (about 95 MB per audit of
+  a 1,000-page site). `squirrel self disk` lists per-project and total usage.
+  `squirrel self disk --prune --keep N` retires the audits beyond the newest N,
+  prints the plan, asks, and then rebuilds the database so the space returns
+  to the filesystem. `--keep` is required: a retired audit can no longer be
+  rendered, and `report --list`, `--diff` and `--regression-since` reach into
+  that history, so the window is your call. Retiring keeps everything the next
+  audit reads (the newest page record per URL, sub-resources, links, images),
+  so an incremental re-crawl still gets its `ETag`s. A retired audit stays
+  listed, marked with the date its data was reclaimed, and `report`, `--diff`,
+  `--regression-since` and `analyze` refuse it instead of rendering an empty
+  report.
+
+- **`squirrel keys` takes `--org`, and `auth whoami` says which org you are.**
+  On an account with more than one organization, `keys create` minted against
+  the newest one rather than the active one, silently. It now takes
+  `--org <slug|id>`, lists the organizations and refuses when there is more
+  than one and no `--org`, and `keys list` and `keys revoke` are scoped the
+  same way. `auth status` and `auth whoami` print the active organization.
+
+- **The audit says when `--max-pages` was clamped.** Asking for more pages than
+  the cap allows used to run at the cap and say nothing. The audit now prints
+  the requested and effective limits, and the JSON and LLM reports carry both,
+  so a clamped audit is distinguishable from a complete one.
+
+- **Template-aware rules.** Pages of one site share their chrome (header,
+  navigation, footer, script stack) far more than their structure: a real
+  storefront's 247 pages fall into 13 chrome clusters. Every page now carries
+  a template cluster key, and page rules whose verdict depends only on the
+  chrome (viewport, doctype, favicon, consent mode, tag manager, font and
+  script delivery, subresource integrity, and others) run once per cluster
+  with the verdict fanned out to the cluster's other members, with findings
+  byte-identical to running them on every page. About 13% less rule CPU on
+  that storefront. `SQUIRREL_TEMPLATE_FANOUT=0` turns it off.
+
+- **The crawl says when its base is the wrong host of a pair.** When the seed
+  redirects between the apex and `www` and the probe is refused, the crawl
+  used to pin itself to the wrong host and drop every link as cross-domain,
+  producing a one-page audit. The probe now sends a real user agent, recovers
+  the base from the links it sees, and warns when the two disagree.
+
+- **A project keeps its last 3 audits.** Re-auditing wrote a whole new crawl and
+  retired nothing, so `project.db` grew by about one audit every time: roughly
+  95 MB per audit of a 1,000-page site, forever, with nothing saying so. A
+  successful audit now retires the audits older than the newest three, which
+  turns that growth into a ceiling. Set the window with `[storage] keep_audits`,
+  or turn it off with `0` or `false`. A retired audit stays listed and says when
+  its data went; it can no longer be opened, diffed, or used as a
+  `--regression-since` baseline, so raise the window if you keep an old audit as
+  a reference. A run that ends `failed` or `blocked` neither retires anything
+  nor takes a place in the window, and the page cache the next audit reads is
+  never part of what goes: a re-audit after retirement still serves every
+  unchanged page from its conditional GET. `squirrel self disk --prune` now
+  offers to rebuild a project whose audits were already retired, which is what
+  returns the freed space to the filesystem.
+
+### Changed
+
+- **The rules pass on script-heavy pages is 40% cheaper.** On a page carrying
+  800 KB of inline script the rules phase cost 274 ms per page; it is now 165.
+  The secret scan and keyword scans skip any pattern whose mandatory literals
+  are provably absent from the page, the skip-link rule stops serializing the
+  whole body once per heading, and two script rules stop counting with regular
+  expressions that built arrays to read their length. Findings are unchanged.
+
+- **The report reads a crawl's checks once, not twice.** Assembling the report
+  loaded every rule result twice; it now loads them once and reuses the rows,
+  which is about 150 MB less peak memory at 1,000 pages. The report also stops
+  building per-page fields (response headers, image lists, structured data)
+  that no output format or renderer ever read.
+
+- **A warm re-crawl compiles seven statements, not thousands.** The storage
+  layer prepared its per-page statements on every call; they are cached now,
+  which takes a re-crawl of an unchanged site from about twelve compilations
+  per page to well under one.
+
+- **Hosted audits stream the carried side of the publish merge.** Finalizing a
+  hosted re-audit held every previously open finding in memory at once, about
+  5 KB each, so a site carrying 60,000 open findings needed 330 MB inside a
+  128 MB worker. Prior findings now stream from a cursor and the report's
+  carried side is a bounded per-rule sample with exact counts, which brings
+  that case under 100 MB with the same scores.
+
+- **A page fingerprint survives a Shopify cache regeneration.** Shopify rewrites
+  request ids and shuffles app-block order between two fetches of the same
+  page, which made every page look changed. The fingerprint now ignores those.
+
+- **A local audit crawls up to 10,000 pages.** The hard cap on `--max-pages`
+  and `[crawler] max_pages` was 5,000; it is now 10,000, on every plan, local
+  audits being free either way. A 10,000-page audit peaks at about 5.4 GB of
+  memory and takes about twelve minutes on a laptop, so the cap is a real
+  ceiling rather than a formality: past it, split the audit by section with
+  `include` patterns. Cloud audits follow their plan instead, and Team's
+  ceiling rises to 10,000 with this release.
+
+  Publishing a report from a crawl this size needs an API that accepts it, so
+  update the CLI only after the hosted side has: an older server rejects a
+  publish carrying more than 2,000 page statuses or 5,000 crawled URLs.
+
+- **A local audit no longer holds the whole site in memory.** The CLI's
+  post-crawl phases ran the resident pipeline: one parsed page plus its DOM per
+  crawled page, held from the end of the crawl through the entire rules pass,
+  and a second full read of every page to assemble the report. Retained heap
+  grew about 1.5 MB per crawled page, so a 2,500-page audit ended holding 3.9 GB
+  while the operating system's "resident" figure read a reassuring 1.4 GB.
+  Every phase after the crawl now walks the pages table in batches sized to the
+  site and drops each batch before reading the next, which is what the hosted
+  runtime has done since v0.0.91. Reports are unchanged, page for page.
+
+  Batch size follows the site's own average page against a byte budget.
+  `SQUIRREL_STREAM_BATCH_BYTES` sets that budget (48 MB of raw HTML by default)
+  and `SQUIRREL_STREAM_BATCH_PAGES` pins an exact page count instead. Turning
+  the budget below roughly a dozen pages' worth is counterproductive: the same
+  crawl becomes several times as many read-parse-collect cycles and peaks
+  higher, not lower.
+
+- **A 429 is reported as a rate limit, not a broken link.** The link rules used
+  to count a rate-limited response as broken; it now needs the status lead-in
+  like every other status.
+
+- **Crawl bookkeeping fixes.** The frontier's page-exists check always answered
+  yes; the content-store prune check answers from a covering index instead of
+  a full scan on every stored page; the container's cloud-prefetch payloads no
+  longer hold their pages alive after use.
+
+## v0.0.91
+
+A release about big sites. A 500-page audit of a store whose pages weigh a
+megabyte each used to hold every parsed page in memory at once, run out of
+room, and fail three times in a row after the crawl had already finished. The
+audit engine now streams: pages are parsed in batches sized to the site, the
+rules pass runs over one batch at a time, and the report is assembled from
+per-rule tallies instead of from every finding at once. The same pass makes a
+finding mean one defect instead of one defect per page, adds three content
+rules for things that should never have shipped, and tightens the installer.
+
+### Added
+
+- **Three content rules for leftovers.** `content/placeholder-text` flags lorem
+  ipsum, unrendered template tags such as `{{ user.name }}`, `[object Object]`,
+  `undefined` in a table cell and `TODO` markers in visible copy.
+  `content/unrendered-markup` catches literal markdown, escaped HTML and
+  double-encoded entities that reached the page as text, and stays quiet
+  inside code blocks and syntax-highlighted samples. `content/dev-leakage`
+  finds `localhost`, private IP ranges, `staging.` and `dev.` hosts, preview
+  deploys (`vercel.app`, `netlify.app`, `pages.dev`, ngrok) and plain `http://`
+  links back to the site's own origin, on a production page.
+
+- **A zero-page audit says why.** When the crawl fetches nothing, the report,
+  the CLI output and the failure notice now name the cause: the host did not
+  resolve, the certificate was rejected, the connection closed before a
+  response, the origin timed out, or it answered with a 4xx or 5xx. Before,
+  every one of those read "No pages were crawled".
+
+### Changed
+
+- **The audit engine streams instead of holding the whole site.** Link checks,
+  asset fetches, the rules pass and the report are all built from batches of
+  parsed pages rather than one array of every page. The batch is sized from a
+  byte budget (48 MB of raw HTML by default, `SQUIRREL_STREAM_BATCH_BYTES`)
+  divided by the site's own average page size, so a docs site with 20 KB pages
+  and a store with 1 MB pages both fit. Peak memory now tracks the batch, not
+  the page count. Progress output reports the sub-phases of the pass
+  (universe, site fetch, page rules, site rules, assemble) as they happen.
+
+- **A finding is one defect, not one defect per page.** An item-level finding
+  such as a cross-origin script without Subresource Integrity now carries its
+  own message and locator instead of inheriting the page's count ("26
+  resources without SRI" on one page, "24" on the next). The same script
+  missing on 400 pages is one finding with 400 affected pages. This also fixes
+  the reverse defect, where unrelated items on the same page shared a
+  fingerprint because the page count matched.
+
+- **Longer budget for large full audits.** The per-page time allowance for a
+  full-coverage audit rose from 4.8 to 7.2 seconds, so a 500-page audit of
+  script-heavy pages reaches the one-hour ceiling instead of being cut off
+  partway through the rules pass.
+
+- **The installer pins its transport.** Every `curl` in `install.sh` now
+  refuses anything but HTTPS (including across redirects), requires TLS 1.2 or
+  newer and follows at most three redirects.
+
+- **The CLI is built on Bun 1.4.** The runtime the `squirrel` binary is
+  compiled with moved from 1.3.14 to 1.4.0, the release Bun rewrote in Rust.
+  The visible effect is size: the Linux binaries that the install script and
+  containers pull are 11 to 14 percent smaller (about 90 MB instead of 101 MB
+  for glibc, 83 MB instead of 97 MB for musl and Alpine), the Windows binary
+  is 8 percent smaller, and the CLI starts about 10 ms faster. Audit results
+  are byte-identical across the two runtimes: the same sites produce the same
+  scores, the same issue counts and the same reports. Every install target was
+  built and run on the new runtime, including the Alpine and musl path.
+
+- **A DNS failure is reported as a DNS failure.** Bun 1.4 is the first runtime
+  that distinguishes a host that does not resolve from one that refuses the
+  connection, and the CLI now passes that distinction through, so an audit of
+  a mistyped domain says the name did not resolve rather than that the server
+  was unreachable.
 
 ## v0.0.90
 

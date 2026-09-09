@@ -181,6 +181,7 @@ export interface ResponseHeaders {
 
 // Re-export from core-contracts (canonical source)
 import type {
+  AuditFailureReasonCode as _AFRC,
   AuditStatus as _AS,
   CacheStats as _CST,
   CategoryScore as _CS,
@@ -193,6 +194,7 @@ import type {
   SiteMetadata as _SM,
 } from "@squirrelscan/core-contracts";
 export type AuditStatus = _AS;
+export type AuditFailureReasonCode = _AFRC;
 export type CategoryScore = _CS;
 export type GroupScore = _GS;
 export type HealthScore = _HS;
@@ -342,18 +344,31 @@ export interface ImageData {
   height: string | null;
 }
 
+/**
+ * One page in a report.
+ *
+ * Several fields are optional because the CLI's report builder stopped
+ * populating them (#1938): nothing read them. No output format emits
+ * `report.pages` at all, and the publish path sends `pages: []` after taking
+ * the urls, the statuses and the home page's title. They stay in the type,
+ * optional, so anything constructing or consuming a PageAudit still compiles —
+ * and so the hosted builder, which DOES publish these, keeps the same shape.
+ *
+ * Read by production code: `url`, `statusCode`, `checks`, `meta` and `og` (the
+ * home-page summary that seeds the website record), `fallbackReason`.
+ */
 export interface PageAudit {
   url: string;
   statusCode: number;
-  loadTime: number;
+  loadTime?: number;
   meta: MetaData;
   og: OpenGraphData;
-  twitter: TwitterData;
-  schema: SchemaData;
-  links: LinkData[];
-  images: ImageData[];
-  h1Count: number;
-  h1Text: string[];
+  twitter?: TwitterData;
+  schema?: SchemaData;
+  links?: LinkData[];
+  images?: ImageData[];
+  h1Count?: number;
+  h1Text?: string[];
   checks: CheckResult[];
   // New fields for expanded audit
   urlAnalysis?: UrlAnalysis;
@@ -412,6 +427,8 @@ export interface AuditReport {
     /** Host(s) that throttled the crawl. */
     hosts: string[];
   };
+  /** Machine-readable class behind `statusReason` (#1822). */
+  statusReasonCode?: AuditFailureReasonCode;
   siteChecks: CheckResult[];
   pages: PageAudit[];
   summary: {
@@ -525,6 +542,8 @@ export interface AuditReport {
   scanScope?: {
     origin: "cli" | "ci" | "cloud";
     maxPages?: number;
+    /** Requested page cap, when it exceeded MAX_PAGES_CAP and was clamped (#1909). */
+    requestedMaxPages?: number;
     pagesCrawled: number;
     capped: boolean;
   };
@@ -571,6 +590,15 @@ export type CoverageMode = "quick" | "surface" | "full";
 export interface AuditOptions {
   url: string;
   maxPages?: number;
+  /**
+   * What the caller asked for BEFORE `MAX_PAGES_CAP` was applied (#1909).
+   *
+   * The command layer clamps `maxPages` for its own display and cost estimate,
+   * so by the time the controller sees it the request is already gone. Passing
+   * it separately is what lets the report record that a clamp happened at all.
+   * Unset when nothing asked for more than the cap.
+   */
+  requestedMaxPages?: number;
   maxDepth?: number; // optional crawl-depth ceiling (#318); unset = unlimited
   outputFormat?:
     | "json"

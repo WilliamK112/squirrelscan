@@ -120,6 +120,38 @@ export const templateDiscontinuityRule: Rule = {
       ? new Map(collected.pages.map((r) => [r.url, r.signals.length]))
       : null;
 
+    // v1 looks the outlier's page up by url to build a context for the signal
+    // detectors. That lookup used to be `pages.find(...)`, a scan of the whole
+    // page set PER OUTLIER: with an outlier share f that is f*n lookups over n
+    // pages, so the branch was quadratic in page count and linear in the share.
+    // It only ever ran on the v1 path — streaming reads the map above — and only
+    // on a site that actually has outliers, which is why a corpus of uniformly
+    // themed pages never showed it (#1910).
+    //
+    // The saving is ASYMPTOTIC, not something you can see today. At the largest
+    // share the rule can be given (one page in three; at one in two the baseline
+    // absorbs both groups and there are no outliers at all) 2,500 pages is
+    // 833 outliers over 2,500 entries, about a million string compares, which is
+    // a small part of a rule that takes ~215 ms. Measured before and after at
+    // that size and share on a quiet machine: 215 ms and 225 ms, i.e. nothing.
+    // The term is real and grows as f*n^2; it is simply not what dominates at a
+    // size this fixture can reach.
+    //
+    // LAZY, so a site with no outliers pays nothing and an outlier run pays one
+    // O(n) build instead of one O(n) scan per outlier, and FIRST-WINS, because
+    // `find` returned the first match and `SiteData.pages` is caller-supplied
+    // and not deduplicated. Building it with `new Map(pages.map(...))` would
+    // keep the LAST entry for a repeated url, which flips this rule's verdict
+    // from info to fail when a benign page and a compromised one share one.
+    let pageByUrl: Map<string, (typeof pages)[number]> | null = null;
+    const pageFor = (url: string) => {
+      if (!pageByUrl) {
+        pageByUrl = new Map();
+        for (const p of pages) if (!pageByUrl.has(p.url)) pageByUrl.set(p.url, p);
+      }
+      return pageByUrl.get(url)!;
+    };
+
     for (const { url, fp } of entries) {
       const similarity = similarityToBaseline(fp, baseline);
       if (similarity >= threshold) continue;
@@ -132,7 +164,7 @@ export const templateDiscontinuityRule: Rule = {
         // signals? Build a minimal page ctx for the signal detectors. `html: ""` is
         // intentional — the detectors read parsed.document/parsed.content, not
         // page.html (see orphan-page.ts for the same note).
-        const page = pages.find((p) => p.url === url)!;
+        const page = pageFor(url);
         const pageCtx: RuleContext = {
           page: {
             url: page.url,
