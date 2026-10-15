@@ -79,6 +79,7 @@ describe("nonPublicHostLabel", () => {
     ["http://db.svc/", "db.svc"],
     ["http://host.lan/", "host.lan"],
     ["http://thing.corp/", "thing.corp"],
+    ["http://myapp.test/", "myapp.test"],
     // Single-label: resolves through the machine's own search domain.
     ["http://intranet/", "intranet"],
     ["http://nas:8080/", "nas:8080"],
@@ -126,7 +127,7 @@ describe("nonPublicHostLabel", () => {
     ["https://localhost.example.com/"],
     ["https://mylocalhost.com/"],
     ["https://localhost-app.io/"],
-    ["https://shop.local.example/"],
+    ["https://shop.local.example.com/"],
     ["https://10.0.0.1.example.com/"],
   ])("%s is a look-alike and stays public", (url) => {
     expect(nonPublicHostLabel(url)).toBeNull();
@@ -148,6 +149,14 @@ describe("nonPublicHostLabel", () => {
 });
 
 describe("isNonPublicHostname", () => {
+  test.each(["test", "example", "invalid", "localdomain", "home", "onion", "alt"])(
+    "%s and its subdomains are non-public",
+    (zone) => {
+      expect(isNonPublicHostname(zone)).toBe(true);
+      expect(isNonPublicHostname(`service.${zone}`)).toBe(true);
+    },
+  );
+
   test("trailing dots are stripped, and a long run of dots stays linear", () => {
     expect(isNonPublicHostname("localhost...")).toBe(true);
     expect(isNonPublicHostname("example.com.")).toBe(false);
