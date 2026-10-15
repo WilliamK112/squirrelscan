@@ -152,6 +152,8 @@ describe("the bulk checker only ever gets public links", () => {
       `http://localhost:${port}/b`,
       `http://nas:${port}/c`,
       `http://printer.local:${port}/d`,
+      // pub#805: a Valet or Herd site's own `.test` links stay local too.
+      `http://other.test:${port}/e`,
     ];
     const results = await run([PUBLIC, ...nonPublic], {
       egress: policy(true),

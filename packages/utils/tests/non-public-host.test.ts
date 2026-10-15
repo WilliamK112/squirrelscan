@@ -129,6 +129,13 @@ describe("nonPublicHostLabel", () => {
     ["https://localhost-app.io/"],
     ["https://shop.local.example.com/"],
     ["https://10.0.0.1.example.com/"],
+    // pub#805: the reserved zones match only as the last label.
+    ["https://test.com/"],
+    ["https://shop.test.io/"],
+    ["https://example.com/"],
+    ["https://home.com/"],
+    ["https://foo.homes/"],
+    ["https://onion.io/"],
   ])("%s is a look-alike and stays public", (url) => {
     expect(nonPublicHostLabel(url)).toBeNull();
   });
@@ -156,6 +163,11 @@ describe("isNonPublicHostname", () => {
       expect(isNonPublicHostname(`service.${zone}`)).toBe(true);
     },
   );
+
+  test("the reserved zones ignore case and trailing dots", () => {
+    expect(isNonPublicHostname("MyApp.TEST.")).toBe(true);
+    expect(isNonPublicHostname("Shop.Example..")).toBe(true);
+  });
 
   test("trailing dots are stripped, and a long run of dots stays linear", () => {
     expect(isNonPublicHostname("localhost...")).toBe(true);

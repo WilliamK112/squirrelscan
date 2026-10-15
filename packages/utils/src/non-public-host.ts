@@ -24,7 +24,8 @@
  * loopback names, the cloud metadata names, the internal-only zones, and the
  * dotless-host rule) so the two sides agree on the cases a private-IP check
  * alone cannot see: `box.local`, `metadata.google.internal`, `intranet`,
- * `localhost.`.
+ * `localhost.`. The reserved and special-use zones added for pub#805 (`test`
+ * through `alt` below) reach the API's list separately.
  *
  * SYNTACTIC ONLY: no DNS lookup. A public name that happens to resolve to a
  * private address (`127.0.0.1.nip.io`, an `/etc/hosts` entry) is public here,
@@ -67,9 +68,9 @@ const METADATA_HOSTNAMES = new Set([
  * 6761), `onion` is special-use (RFC 7686), and `alt` is reserved for
  * non-DNS namespaces (RFC 9476). `corp` is indefinitely deferred by ICANN;
  * the remaining conventional local-only zones are not delegated public TLDs,
- * so no public site can sit under one. The list is the API's
- * `classifyHostedEgressHost` list, entry for entry: if a zone is ever delegated,
- * both change together.
+ * so no public site can sit under one. The API's `classifyHostedEgressHost`
+ * list is meant to match this one entry for entry, and gains the pub#805 zones
+ * separately: if a zone is ever delegated, both change together.
  */
 const NON_PUBLIC_NAME_ZONES = [
   "localhost",
