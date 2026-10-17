@@ -25,6 +25,54 @@ export interface SignatureViews {
 /** Elements whose content a page uses to quote code or sample output. */
 const QUOTE_ELEMENTS = new Set(["code", "kbd", "samp"]);
 
+/** Block boundaries that stop an unclosed inline quote element. */
+const QUOTE_BOUNDARY_ELEMENTS = new Set([
+  "address",
+  "article",
+  "aside",
+  "blockquote",
+  "body",
+  "caption",
+  "dd",
+  "details",
+  "dialog",
+  "div",
+  "dl",
+  "dt",
+  "fieldset",
+  "figcaption",
+  "figure",
+  "footer",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "hgroup",
+  "html",
+  "li",
+  "main",
+  "menu",
+  "nav",
+  "ol",
+  "p",
+  "pre",
+  "search",
+  "section",
+  "summary",
+  "table",
+  "tbody",
+  "td",
+  "tfoot",
+  "th",
+  "thead",
+  "tr",
+  "ul",
+]);
+
 /**
  * Raw-text and RCDATA elements (HTML Standard 13.2.5): their content is never
  * parsed as tags. `textarea` and `xmp` hold quoted text; `iframe`, `noembed`,
@@ -112,6 +160,13 @@ export function signatureViews(html: string): SignatureViews {
     const end = tagEnd(html, nameEnd);
     const tag = html.slice(lt, end + 1);
     cursor = end + 1;
+
+    // Inline formatting elements do not remain open past a closing block
+    // boundary. Recover there so one malformed quote cannot hide the rest of
+    // the sampled page from the wording signatures.
+    if (closing && quoteDepth > 0 && QUOTE_BOUNDARY_ELEMENTS.has(name)) {
+      quoteDepth = 0;
+    }
 
     if (QUOTE_ELEMENTS.has(name)) {
       quoteDepth = closing ? Math.max(0, quoteDepth - 1) : quoteDepth + 1;

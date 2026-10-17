@@ -245,6 +245,21 @@ describe("a signature counts where it acts, not where a page quotes it (#693)", 
     expect(detectWafChallengePage(page(CF_CHALLENGE, 200, CF_HEADERS))).toEqual({ detected: true, provider: "Cloudflare" });
   });
 
+  const incidentLine = "Request unsuccessful. Incapsula incident ID: 1234000280151781213-1234";
+  const unclosedQuoteCases: Array<[string, string]> = ["code", "kbd", "samp"].flatMap((quote) =>
+    ["p", "div", "pre", "li", "td", "body"].map((boundary) => [quote, boundary]),
+  );
+
+  test.each(unclosedQuoteCases)("an unclosed <%s> ends at </%s> (#904)", (quote, boundary) => {
+    const html = `<html><body><${quote}>quoted example</${boundary}>${incidentLine}</body></html>`;
+    expect(detectWafFromContent(html)).toMatchObject({ detected: true, provider: "imperva" });
+  });
+
+  test("a closed pre/code still hides the same incident line (#904)", () => {
+    const html = `<html><body><pre><code>${incidentLine}</code></pre></body></html>`;
+    expect(detectWafFromContent(html)).toMatchObject({ detected: false, provider: null });
+  });
+
   test("a short page quoting DataDome's captcha host or Kasada's client is not their interstitial", () => {
     for (const html of [
       "<html><body><pre><code>https://ct.captcha-delivery.com/c.js</code></pre></body></html>",
