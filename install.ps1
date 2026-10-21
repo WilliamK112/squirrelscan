@@ -252,20 +252,20 @@ function Test-ForceMirror {
 }
 
 # Keep these installer metadata guards aligned with the validation in
-# apps/cli/src/self/releases.ts. Installer versions may carry the tag's `v`.
+# apps/cli/src/self/paths.ts. Installer versions may carry the tag's `v`.
 function Test-ReleaseVersion {
     param([string]$Value)
-    return $Value -cmatch '^v?[0-9A-Za-z.-]+$'
+    return $Value -cmatch '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?\z'
 }
 
 function Test-ReleaseFilename {
     param([string]$Value)
-    return $Value -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+    return $Value -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\z'
 }
 
 function Test-Sha256 {
     param([string]$Value)
-    return $Value -cmatch '^[0-9a-fA-F]{64}$'
+    return $Value -cmatch '^[0-9a-fA-F]{64}\z'
 }
 
 # The two sources for one asset, in the order to try them, as (host, url)
