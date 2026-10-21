@@ -41,6 +41,22 @@ Crawl-delay: 10
     expect(checks[0]?.value).toContain("Google ignores Crawl-delay");
   });
 
+  test("explains Google and Bing behavior for a slow Bing-specific group", () => {
+    const checks = run(`
+User-agent: BingBot
+Crawl-delay: 12
+`);
+
+    expect(checks).toHaveLength(1);
+    expect(checks[0]).toMatchObject({
+      status: "warn",
+      message: "Crawl-delay 12s slows Bing crawling for User-agent: BingBot",
+    });
+    expect(checks[0]?.value).toContain("Google ignores Crawl-delay");
+    expect(checks[0]?.value).toContain("Bing obeys it");
+    expect(checks[0]?.value).toContain("7,200 URLs/day");
+  });
+
   test("reports a short wildcard delay as information", () => {
     const checks = run(`
 User-agent: *

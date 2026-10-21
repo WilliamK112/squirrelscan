@@ -25,20 +25,20 @@ function crawlDelayCheck(userAgent: string, delay: number): CheckResult | null {
       name: "robots-txt-crawl-delay",
       status: "warn",
       message: `Crawl-delay ${delay}s slows Bing crawling for User-agent: ${userAgent}`,
-      value: `${normalizedAgent === "*" ? "Google ignores Crawl-delay; " : ""}Bing may fetch at most about ${formatInteger(dailyCap)} URLs/day`,
+      value: `Google ignores Crawl-delay; Bing obeys it and may fetch at most about ${formatInteger(dailyCap)} URLs/day`,
       items: [{ id: userAgent, label: `User-agent: ${userAgent}; Crawl-delay: ${delay}` }],
     };
   }
 
   let behavior = "This search crawler may honor the directive";
   if (normalizedAgent === "*") {
-    behavior = "Google ignores Crawl-delay; Bing and Yandex may honor it";
+    behavior = "Google ignores Crawl-delay; Bing and Yandex obey it";
   } else if (normalizedAgent === "googlebot") {
     behavior = "Google ignores this directive";
   } else if (normalizedAgent === "bingbot" || normalizedAgent === "msnbot") {
-    behavior = "Bing may honor this directive";
+    behavior = "Bing obeys this directive";
   } else if (normalizedAgent === "yandex") {
-    behavior = "Yandex may honor this directive";
+    behavior = "Yandex obeys this directive";
   }
 
   return {
