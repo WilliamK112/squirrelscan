@@ -174,9 +174,9 @@ describe("standard fetch body deadline (#1729)", () => {
     }
   });
 
-  test("a stalled 403 challenge probe is classified as a timeout", async () => {
-    // A 403 body is sampled for challenge proof before the status guard. If
-    // that prefix stalls, the request deadline must still cancel the socket.
+  test("a stalled 403 challenge probe stays blocked and cancels the connection", async () => {
+    // A 403 body is sampled only to name the challenge provider. If that prefix
+    // stalls, the status still proves refusal and the deadline cancels the socket.
     const seen = { aborted: false };
     const server = serveStalling(seen, 403);
     try {
@@ -185,7 +185,10 @@ describe("standard fetch body deadline (#1729)", () => {
       );
 
       expect(result._tag).toBe("Left");
-      if (result._tag === "Left") expect(result.left.type).toBe("timeout");
+      if (result._tag === "Left") {
+        expect(result.left.type).toBe("blocked");
+        expect(result.left.message).toBe("Request blocked by server");
+      }
 
       await settle();
       expect(seen.aborted).toBe(true);

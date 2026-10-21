@@ -50,7 +50,7 @@ export type CrawlErrorType =
 const TIMEOUT_MESSAGE = "Crawl request timed out";
 
 /** Bound refusal-body reads while leaving enough context to reject real pages. */
-const WAF_CHALLENGE_BODY_BYTES = 512 * 1024;
+const WAF_CHALLENGE_BODY_BYTES = 64 * 1024;
 
 export class CrawlError extends Error {
   constructor(
@@ -1150,16 +1150,20 @@ function fetchPageStandardOnce(
     const challengeBody =
       statusMayBeChallenge && finalResponse.headers.get("cf-mitigated") !== "challenge"
         ? yield* readBody(WAF_CHALLENGE_BODY_BYTES).pipe(
-            Effect.catchAll((error) =>
-              // #1729: a deadline firing on a stalled body is a TIMEOUT, and
-              // swallowing it here reclassified it as the generic "Server error:
-              // 403/503" — the origin blamed for what was actually our own deadline.
-              // Every other read failure still degrades to "no body" so the
-              // guard can classify the refusal from its headers alone.
-              error.type === "timeout"
+            Effect.catchAll((error) => {
+              // A 403 already proves the request was refused. The body is only
+              // sampled to name the challenge provider, so an unreadable or
+              // stalled sample degrades to the generic blocked result.
+              if (finalResponse.status === 403) return Effect.succeed(undefined);
+
+              // #1729: for a 503, a deadline firing on a stalled body is a
+              // TIMEOUT. Swallowing it here would blame the origin with the
+              // generic "Server error: 503" for what was actually our deadline.
+              // Every other read failure still degrades to "no body".
+              return error.type === "timeout"
                 ? Effect.fail(error)
-                : Effect.succeed(undefined),
-            ),
+                : Effect.succeed(undefined);
+            }),
           )
         : undefined;
 
