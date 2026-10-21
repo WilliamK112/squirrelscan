@@ -70,6 +70,16 @@ Disallow: /slow/
     expect(result.rules[0].crawlDelay).toBe(5);
   });
 
+  it("keeps a user-agent group whose only directive is crawl delay", () => {
+    const content = `
+User-agent: *
+Crawl-delay: 10
+`;
+    const result = parseRobotsTxt(content, "https://example.com/robots.txt");
+
+    expect(result.rules).toEqual([{ userAgent: "*", rules: [], crawlDelay: 10 }]);
+  });
+
   it("ignores inline comments", () => {
     const content = `
 # This is a comment
