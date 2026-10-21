@@ -1212,6 +1212,10 @@ describe("release metadata validation (#167)", () => {
   test.each([
     ["v1.2.3", true],
     ["1.2.3-beta.1", true],
+    ["1.2.3+build.7", true],
+    [".", false],
+    ["..", false],
+    ["v..", false],
     ["../v1.2.3", false],
     ["v1.2.3/asset", false],
     ["v1.2.3?download=1", false],

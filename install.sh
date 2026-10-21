@@ -819,9 +819,10 @@ compute_sha256() {
 }
 
 # Keep these installer metadata guards aligned with the validation in
-# apps/cli/src/self/releases.ts. Installer versions may carry the tag's `v`.
+# apps/cli/src/self/paths.ts. Installer versions may carry the tag's `v`.
 valid_release_version() {
-  [[ "$1" =~ ^v?[0-9A-Za-z.-]+$ ]]
+  local re='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+  [[ "$1" =~ $re ]]
 }
 
 valid_release_filename() {
