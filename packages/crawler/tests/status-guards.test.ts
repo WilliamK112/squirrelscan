@@ -59,6 +59,12 @@ describe("applyStatusGuards (#792/#802)", () => {
     expect(error?.message).toBe("Blocked by Cloudflare challenge (403)");
   });
 
+  test("Akamai challenge body at 403 → blocked, names the provider", async () => {
+    const error = await guard(403, { body: AKAMAI_CHALLENGE });
+    expect(error?.type).toBe("blocked");
+    expect(error?.message).toBe("Blocked by Akamai challenge (403)");
+  });
+
   test("429 → rate_limit with retry-after (ms, #1829)", async () => {
     const error = await guard(429, { headers: { "retry-after": "30" } });
     expect(error?.type).toBe("rate_limit");
