@@ -1219,6 +1219,7 @@ describe("release metadata validation (#167)", () => {
     ["../v1.2.3", false],
     ["v1.2.3/asset", false],
     ["v1.2.3?download=1", false],
+    ["v1.2.3\n", false],
   ])("version %p is accepted: %p", async (version, accepted) => {
     const { code } = await runWithCurlShim(`valid_release_version ${JSON.stringify(version)}`);
     expect(code === 0).toBe(accepted);
