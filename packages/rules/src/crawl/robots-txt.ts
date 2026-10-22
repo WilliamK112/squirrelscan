@@ -14,7 +14,7 @@ function formatInteger(value: number): string {
 
 function crawlDelayCheck(userAgent: string, delay: number): CheckResult | null {
   const normalizedAgent = userAgent.toLowerCase();
-  if (!SEARCH_CRAWL_DELAY_AGENTS.has(normalizedAgent) || !Number.isFinite(delay) || delay < 0) {
+  if (!SEARCH_CRAWL_DELAY_AGENTS.has(normalizedAgent) || !Number.isFinite(delay) || delay <= 0) {
     return null;
   }
 

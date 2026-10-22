@@ -19,7 +19,7 @@ How it works:
 
 ### Added
 
-- `social/og-image-size` now checks the declared or filename-derived format of Open Graph and Twitter card images. SVG warns because preview clients may not render it, AVIF reports inconsistent support, and JPEG, PNG, GIF and WebP pass without fetching the image. Both `name="twitter:image"` and `property="twitter:image"` are recognized. See [og:image size and format](https://docs.squirrelscan.com/rules/social/og-image-size).
+
 
 ### Fixed
 

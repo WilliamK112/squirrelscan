@@ -80,6 +80,29 @@ Crawl-delay: 10
     expect(result.rules).toEqual([{ userAgent: "*", rules: [], crawlDelay: 10 }]);
   });
 
+  it("applies one group's directives to every stacked user agent", () => {
+    const content = `
+User-agent: BingBot
+User-agent: AhrefsBot
+Crawl-delay: 10
+Disallow: /slow/
+`;
+    const result = parseRobotsTxt(content, "https://example.com/robots.txt");
+
+    expect(result.rules).toEqual([
+      {
+        userAgent: "BingBot",
+        rules: [{ type: "disallow", path: "/slow/" }],
+        crawlDelay: 10,
+      },
+      {
+        userAgent: "AhrefsBot",
+        rules: [{ type: "disallow", path: "/slow/" }],
+        crawlDelay: 10,
+      },
+    ]);
+  });
+
   it("ignores inline comments", () => {
     const content = `
 # This is a comment

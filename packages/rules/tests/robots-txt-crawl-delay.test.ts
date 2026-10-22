@@ -79,6 +79,29 @@ Crawl-delay: 10
     ).toEqual([]);
   });
 
+  test("reports a search crawler in a stacked user-agent group", () => {
+    const checks = run(`
+User-agent: BingBot
+User-agent: AhrefsBot
+Crawl-delay: 10
+`);
+
+    expect(checks).toHaveLength(1);
+    expect(checks[0]).toMatchObject({
+      status: "warn",
+      message: "Crawl-delay 10s slows Bing crawling for User-agent: BingBot",
+    });
+  });
+
+  test("ignores a zero crawl delay", () => {
+    expect(
+      run(`
+User-agent: *
+Crawl-delay: 0
+`),
+    ).toEqual([]);
+  });
+
   test("adds no finding when robots.txt has no crawl delay", () => {
     expect(
       run(`
