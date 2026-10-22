@@ -90,7 +90,9 @@ export const ogImageSizeRule: Rule = {
     const ogImageType = doc.querySelector('meta[property="og:image:type"]');
     const ogImageWidth = doc.querySelector('meta[property="og:image:width"]');
     const ogImageHeight = doc.querySelector('meta[property="og:image:height"]');
-    const twitterImage = doc.querySelector('meta[name="twitter:image"]');
+    const twitterImage = doc.querySelector(
+      'meta[name="twitter:image"], meta[property="twitter:image"]',
+    );
 
     if (!ogImage) {
       checks.push({

@@ -70,6 +70,16 @@ describe("social/og-image-size image formats", () => {
     expect(checks.find((row) => row.name === "og-image-size")?.status).toBe("info");
   });
 
+  test("checks the property form of twitter:image", () => {
+    const url = "https://cdn.example.com/twitter-card.svg";
+    const checks = run(meta("twitter:image", url));
+
+    expect(checks.find((row) => row.name === "twitter-image-format")).toMatchObject({
+      status: "warn",
+      items: [{ id: url, label: `twitter:image: ${url}` }],
+    });
+  });
+
   test("does not fetch image URLs to identify their format", () => {
     const originalFetch = globalThis.fetch;
     let calls = 0;
