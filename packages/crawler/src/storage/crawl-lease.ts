@@ -1,8 +1,8 @@
-// Crawl lease writer (#946).
+// Crawl lease writer and resume gate (#946, #1026).
 //
 // The process driving a crawl records its pid, host and a heartbeat on the
 // `crawls` row, so liveness is written down rather than inferred from newer
-// audits. This module only WRITES the lease; nothing reads it yet.
+// audits. A resume must claim the lease before it starts writing the crawl.
 //
 // The beat runs on its OWN connection with a 1 s busy timeout. The crawl
 // writer's connection waits up to 15 s on a lock; a beat sharing that wait would
@@ -21,7 +21,7 @@ import {
 } from "./types";
 
 export interface CrawlLeaseOptions {
-  /** The project database file. `:memory:` and a missing file yield a no-op. */
+  /** The project database file. `:memory:` yields a no-op; a missing file cannot be claimed. */
   readonly dbPath: string;
   /** The crawl this process drives; null until the crawl row exists. */
   readonly getCrawlId: () => string | null;
@@ -34,11 +34,33 @@ export interface CrawlLeaseOptions {
 export interface CrawlLease {
   /** One beat now. True when written, false when skipped (no id, busy, error). */
   readonly beat: () => boolean;
+  /** Atomically claim a specific crawl before resuming it. */
+  readonly claim: (crawlId: string) => CrawlLeaseClaim;
   /** Stop beating and clear the owner. Idempotent; never throws. */
   readonly release: () => void;
 }
 
-const NOOP_LEASE: CrawlLease = { beat: () => false, release: () => {} };
+export type CrawlLeaseClaim =
+  | { readonly acquired: true }
+  | {
+      readonly acquired: false;
+      readonly ownerPid?: number;
+      readonly ownerHost?: string;
+    };
+
+const ACQUIRED: CrawlLeaseClaim = { acquired: true };
+const NOOP_LEASE: CrawlLease = {
+  beat: () => false,
+  // Non-file stores cannot be shared by two CLI processes, so there is no
+  // competing writer to reject and resume keeps its previous behavior.
+  claim: () => ACQUIRED,
+  release: () => {},
+};
+const UNAVAILABLE_LEASE: CrawlLease = {
+  beat: () => false,
+  claim: () => ({ acquired: false }),
+  release: () => {},
+};
 
 /** Leases this process holds, so a signal handler can release them (see releaseActiveLeases). */
 const activeLeases = new Set<CrawlLease>();
@@ -70,7 +92,7 @@ export function startCrawlLease(options: CrawlLeaseOptions): CrawlLease {
 
   let db: Database | null = null;
   try {
-    // Never create a database from the lease: a missing file is a no-op.
+    // Never create a database from the lease: a missing file cannot be claimed.
     db = new Database(options.dbPath, { readwrite: true, create: false });
     db.exec(`PRAGMA busy_timeout = ${CRAWL_LEASE_BUSY_TIMEOUT_MS}`);
   } catch {
@@ -79,7 +101,7 @@ export function startCrawlLease(options: CrawlLeaseOptions): CrawlLease {
     } catch {
       // nothing to do
     }
-    return NOOP_LEASE;
+    return UNAVAILABLE_LEASE;
   }
 
   const held = new Set<string>();
@@ -89,16 +111,12 @@ export function startCrawlLease(options: CrawlLeaseOptions): CrawlLease {
   // the heartbeat, also after a busy skip.
   let haveId = false;
 
-  const beat = (): boolean => {
-    if (released || !db) return false;
-    const id = options.getCrawlId();
-    if (!id) return false;
-    haveId = true;
+  const claim = (id: string): CrawlLeaseClaim => {
+    if (released || !db) return { acquired: false };
     try {
       // Compare-and-set: take the lease when it is free, ours, or stale, so two
       // processes on one crawl do not steal it from each other every beat, while
       // a resume still takes over a killed owner's lease. A stale sweep heals too.
-      // PR 2 must design what a LIVE foreign owner means (the writer just yields).
       const t = now();
       const result = db
         .prepare(
@@ -109,13 +127,35 @@ export function startCrawlLease(options: CrawlLeaseOptions): CrawlLease {
         .run(pid, host, t, id, pid, host, t - CRAWL_LEASE_STALE_MS);
       if (Number(result.changes ?? 0) > 0) {
         held.add(id);
-        return true;
+        return ACQUIRED;
       }
-      return takeOverDeadOwner(id);
+      if (takeOverDeadOwner(id)) return ACQUIRED;
+
+      const owner = db
+        .prepare("SELECT owner_pid, owner_host FROM crawls WHERE id = ?")
+        .get(id) as { owner_pid: unknown; owner_host: unknown } | null;
+      return {
+        acquired: false,
+        ...(typeof owner?.owner_pid === "number"
+          ? { ownerPid: owner.owner_pid }
+          : {}),
+        ...(typeof owner?.owner_host === "string"
+          ? { ownerHost: owner.owner_host }
+          : {}),
+      };
     } catch {
-      // SQLITE_BUSY past the 1 s timeout, or a DB without the columns: skip.
-      return false;
+      // SQLITE_BUSY past the 1 s timeout, or a DB without the columns: do not
+      // resume without proving this process is the sole writer.
+      return { acquired: false };
     }
+  };
+
+  const beat = (): boolean => {
+    if (released || !db) return false;
+    const id = options.getCrawlId();
+    if (!id) return false;
+    haveId = true;
+    return claim(id).acquired;
   };
 
   // A resume right after a kill -9: the dead owner's heartbeat is still fresh,
@@ -190,7 +230,7 @@ export function startCrawlLease(options: CrawlLeaseOptions): CrawlLease {
     }
   };
 
-  const lease: CrawlLease = { beat, release };
+  const lease: CrawlLease = { beat, claim, release };
   activeLeases.add(lease);
   return lease;
 }

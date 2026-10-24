@@ -24,6 +24,7 @@ How it works:
 
 ### Fixed
 
+- A second `audit --resume` or `crawl --resume` no longer writes into a crawl already owned by a live process. It starts a new crawl and names the existing owner's PID and host; stale leases and exited same-host owners can still be resumed (#1026).
 - robots.txt parsing now gives consecutive `User-agent` lines the rules that follow them, keeps a named group whose empty `Disallow:` explicitly allows every path, and ignores inline comments, so AI-crawler and indexability checks match how crawlers read those common files (#1078).
 
 ## v0.0.133 (2026-10-24)

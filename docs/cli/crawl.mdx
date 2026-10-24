@@ -89,6 +89,11 @@ squirrel crawl https://example.com --refresh
 squirrel crawl https://example.com --resume
 ```
 
+Resume only continues a crawl when this process can claim it. If another live
+process already owns that crawl, the command names its PID and host and starts a
+new crawl instead. A stale lease or a process that has exited on this host is
+taken over automatically.
+
 ## Crawl behavior
 
 The crawl command:
