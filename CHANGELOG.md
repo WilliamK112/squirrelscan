@@ -24,6 +24,7 @@ How it works:
 
 ### Fixed
 
+- Glossary JSON-LD stays in rendered pages without leaking its raw script text into `llms-full.txt` or per-page agent Markdown (#1113).
 - robots.txt parsing now gives consecutive `User-agent` lines the rules that follow them, keeps a named group whose empty `Disallow:` explicitly allows every path, and ignores inline comments, so AI-crawler and indexability checks match how crawlers read those common files (#1078).
 
 ## v0.0.133 (2026-10-24)
