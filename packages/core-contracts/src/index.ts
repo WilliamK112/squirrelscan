@@ -2202,6 +2202,7 @@ export interface EnhancedImageData extends ImageData {
 
 export interface CWVHints {
   largeImagesWithoutPreload: string[];
+  imagePreloadUrls: string[];
   renderBlockingResources: string[];
   fontsWithoutSwap: string[];
   missingPreconnect: string[];
