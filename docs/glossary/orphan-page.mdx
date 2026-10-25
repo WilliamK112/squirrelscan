@@ -22,7 +22,7 @@ A sitemap entry makes a URL discoverable, but internal links are what place a pa
 
 The answer depends on what the crawl reached, so all three rules are site-wide. [links/orphan-pages](/rules/links/orphan-pages) counts the followed, resolvable internal links pointing at every crawled page and reports pages with fewer than 2, a configurable threshold. A page the crawl reached only from the sitemap shows up here. [links/no-contextual-inbound](/rules/links/no-contextual-inbound) catches the near-orphans: pages whose only inbound links sit in navigation, header, footer or aside landmarks. [integrity/orphan-page](/rules/integrity/orphan-page) looks for hidden pages: no inbound internal links and, when the site has a sitemap, absent from it. A hidden page that also carries a page-level compromise signal fails as likely injected, and the rest are listed for review at info level.
 
-The homepage and the page the audit started from are never reported. A crawl that stops early, or starts from a sitemap it cannot reach, produces orphans that only exist in the crawl, so check coverage before acting on a long list.
+The homepage and the page the audit started from are never reported. The inbound-link rules skip when the crawl stops at its page cap. A crawl that stops early for another reason, such as a time limit or interruption, or starts from a sitemap it cannot reach can still produce orphans that only exist in the crawl, so check coverage before acting on a long list.
 
 {/* glossary:rules:start */}
 
