@@ -2761,6 +2761,9 @@ export function createCrawler(
             maxBackoffMs: config.maxBackoffMs,
             timeoutMs: config.timeoutMs,
             userAgent: config.userAgent,
+            // Always recorded ("" = matched on userAgent), so a resumed crawl and
+            // the analysis after it read the group this crawl was matched as.
+            robotsUserAgent: config.robotsUserAgent ?? "",
             followRedirects: config.followRedirects,
             respectRobots: config.respectRobots,
             incremental: config.incremental,
@@ -2810,7 +2813,14 @@ export function createCrawler(
         // sitemap discovery and the crawl/robots-txt rule need it. Only
         // Disallow enforcement and Crawl-delay honoring are conditional.
         const robotsResult = yield* Effect.either(
-          fetchRobots(baseUrl, config.userAgent, true, customHeadersFor(baseUrl), preamble),
+          fetchRobots(
+            baseUrl,
+            config.userAgent,
+            true,
+            customHeadersFor(baseUrl),
+            preamble,
+            config.robotsUserAgent,
+          ),
         );
         if (robotsResult._tag === "Right") {
           robots = robotsResult.right;
@@ -3077,6 +3087,9 @@ export function createCrawler(
 
         // Restore config from crawl
         Object.assign(config, crawl.config);
+        // A crawl recorded before robotsUserAgent existed was matched on its user
+        // agent; it keeps that group rather than taking this run's token.
+        if (!("robotsUserAgent" in crawl.config)) config.robotsUserAgent = undefined;
 
         // Fetch robots.txt again — always, regardless of respectRobots (#790).
         // Budgeted like every other preamble fetch (squirrelscan/repo#1733).
@@ -3087,6 +3100,7 @@ export function createCrawler(
             true,
             customHeadersFor(baseUrl),
             createPhaseBudget(preambleBudgetMs(config.timeoutMs), Date.now(), undefined, crawlEgress),
+            config.robotsUserAgent,
           ),
         );
         if (robotsResult._tag === "Right") {
@@ -3249,7 +3263,14 @@ export function createCrawler(
 
         // Fetch robots.txt — always, regardless of respectRobots (#790).
         const robotsResult = yield* Effect.either(
-          fetchRobots(baseUrl, config.userAgent, true, customHeadersFor(baseUrl), preamble),
+          fetchRobots(
+            baseUrl,
+            config.userAgent,
+            true,
+            customHeadersFor(baseUrl),
+            preamble,
+            config.robotsUserAgent,
+          ),
         );
         if (robotsResult._tag === "Right") {
           robots = robotsResult.right;
