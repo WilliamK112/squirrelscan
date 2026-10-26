@@ -82,4 +82,20 @@ describe("a11y/identical-links-same-purpose context", () => {
 
     expect(result?.status).toBe("pass");
   });
+
+  test("a labelled context shared by thousands of links completes", () => {
+    const labels = Array.from(
+      { length: 8 },
+      (_, index) => `<span id="label-${index}">Section ${index}</span>`,
+    ).join("");
+    const links = Array.from(
+      { length: 5_000 },
+      () => '<li><a href="/catalog">Catalog</a></li>',
+    ).join("");
+    const labelledBy = Array.from({ length: 8 }, (_, index) => `label-${index}`).join(" ");
+
+    const result = run(`${labels}<ul aria-labelledby="${labelledBy}">${links}</ul>`);
+
+    expect(result?.status).toBe("pass");
+  });
 });

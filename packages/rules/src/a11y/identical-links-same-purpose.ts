@@ -5,35 +5,64 @@ import type { CheckResult, Rule, RuleContext, RuleResult } from "../types";
 const MAX_CONTEXT_ANCESTORS = 64;
 const MAX_LABELLED_BY_IDS = 8;
 
+interface ElementContext {
+  label: string;
+  leadingLink: Element | null;
+  leadingLinkLabel: string;
+}
+
 function normalizedText(value: string | null | undefined): string {
   return value?.replace(/\s+/g, " ").trim().toLowerCase() ?? "";
 }
 
-function linkContext(link: Element, doc: Document): string {
+function elementContext(
+  element: Element,
+  doc: Document,
+  cache: Map<Element, ElementContext>,
+): ElementContext {
+  const cached = cache.get(element);
+  if (cached) return cached;
+
+  let label = "";
+  const labelledBy = element.getAttribute("aria-labelledby");
+  if (labelledBy) {
+    label = labelledBy
+      .trim()
+      .split(/\s+/)
+      .slice(0, MAX_LABELLED_BY_IDS)
+      .map((id) => normalizedText(doc.getElementById(id)?.textContent))
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  if (!label) {
+    label = normalizedText(element.getAttribute("aria-label"));
+  }
+
+  let leadingLink: Element | null = null;
+  let leadingLinkLabel = "";
+  if (!label && element.tagName.toLowerCase() === "li") {
+    leadingLink = element.querySelector("a[href]");
+    leadingLinkLabel = normalizedText(leadingLink?.textContent);
+  }
+
+  const context = { label, leadingLink, leadingLinkLabel };
+  cache.set(element, context);
+  return context;
+}
+
+function linkContext(
+  link: Element,
+  doc: Document,
+  contextCache: Map<Element, ElementContext>,
+): string {
   let ancestor = link.parentElement;
 
   for (let depth = 0; ancestor && depth < MAX_CONTEXT_ANCESTORS; depth++) {
-    const labelledBy = ancestor.getAttribute("aria-labelledby");
-    if (labelledBy) {
-      const label = labelledBy
-        .trim()
-        .split(/\s+/)
-        .slice(0, MAX_LABELLED_BY_IDS)
-        .map((id) => normalizedText(doc.getElementById(id)?.textContent))
-        .filter(Boolean)
-        .join(" ");
-      if (label) return label;
-    }
-
-    const ariaLabel = normalizedText(ancestor.getAttribute("aria-label"));
-    if (ariaLabel) return ariaLabel;
-
-    if (ancestor.tagName.toLowerCase() === "li") {
-      const leadingLink = ancestor.querySelector("a[href]");
-      if (leadingLink && leadingLink !== link) {
-        const label = normalizedText(leadingLink.textContent);
-        if (label) return label;
-      }
+    const context = elementContext(ancestor, doc, contextCache);
+    if (context.label) return context.label;
+    if (context.leadingLink && context.leadingLink !== link && context.leadingLinkLabel) {
+      return context.leadingLinkLabel;
     }
 
     ancestor = ancestor.parentElement;
@@ -64,6 +93,7 @@ export const identicalLinksSamePurposeRule: Rule = {
 
     const links = doc.querySelectorAll("a[href]");
     const linkGroups = new Map<string, { text: string; context: string; hrefs: Set<string> }>();
+    const contextCache = new Map<Element, ElementContext>();
 
     for (const link of links) {
       const text = normalizedText(link.textContent);
@@ -80,7 +110,7 @@ export const identicalLinksSamePurposeRule: Rule = {
       // Remove query strings for basic comparison
       const baseHref = normalizedHref.split("?")[0];
 
-      const context = linkContext(link, doc);
+      const context = linkContext(link, doc, contextCache);
       const groupKey = JSON.stringify([text, context]);
       let group = linkGroups.get(groupKey);
       if (!group) {
