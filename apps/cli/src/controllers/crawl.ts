@@ -1,5 +1,6 @@
 // Crawl controller - runs crawl only without analysis
 
+import { customUserAgent } from "@squirrelscan/utils/headers";
 import { Effect, Stream } from "effect";
 
 import type { Config } from "@/config";
@@ -250,8 +251,13 @@ export async function runCrawl(
     try {
       // Resolve user-agent: empty string = random browser UA, pinned per
       // project so re-runs serve the same markup (#875)
+      // A custom `User-Agent` header is the crawl's agent on every request that
+      // carries it, so it is also the agent of the probes that send no custom
+      // headers (#1152).
+      const configuredUserAgent =
+        config.crawler.user_agent || customUserAgent(config.crawler.headers);
       const { userAgent, source: uaSource } = await Effect.runPromise(
-        resolveStickyUserAgent(config.crawler.user_agent, storage, {
+        resolveStickyUserAgent(configuredUserAgent, storage, {
           freshUa: options.freshUa,
         })
       );
