@@ -348,6 +348,33 @@ export async function assertEgressAllowed(
 }
 
 /**
+ * True when `policy` refuses a request to `url` ({@link vetEgressTarget} throws
+ * {@link EgressRefusedError}); nothing is sent either way. For a hand-rolled
+ * redirect loop that ends at a refused hop instead of failing the whole fetch
+ * (repo#2830). Any other error (a resolver failure) propagates: a caller that
+ * would otherwise follow the hop treats it as refused (fail closed).
+ *
+ * False holds only for a request sent through {@link egressGuardedSend} with
+ * the same policy, which connects to the vetted address. A pinning policy (pin
+ * unset) sets scoped link-local answers aside, which is safe only because the
+ * pinned connect never uses them; a caller that checks here and then sends by
+ * name must pass `pin: false`, which judges every answer.
+ */
+export async function egressRefuses(
+  url: string,
+  policy: EgressPolicy,
+  signal?: AbortSignal | null,
+): Promise<boolean> {
+  try {
+    await vetEgressTarget(url, policy, signal);
+    return false;
+  } catch (error) {
+    if (error instanceof EgressRefusedError) return true;
+    throw error;
+  }
+}
+
+/**
  * True when `policy` refuses `url` on what the URL itself says, with no DNS
  * lookup: a non-http(s) scheme, a host outside `allowHost`, a refused IP
  * literal, a metadata hostname, or a non-public name the policy does not
@@ -409,7 +436,14 @@ export async function vetEgressTarget(
     throw new EgressRefusedError("refused non-public host");
   }
 
-  const addresses = await raceAbort((policy.resolve ?? resolveHostAddresses)(host), signal);
+  const answers = await raceAbort((policy.resolve ?? resolveHostAddresses)(host), signal);
+  // A scoped link-local answer (`fe80::1%en0`) cannot be pinned in a URL, so a
+  // pinned request never connects to it. A LAN name (`nas.local`) answers one
+  // beside its routable addresses on macOS, and refusing the whole name for it
+  // refused every redirect between LAN hosts (repo#2830), so it is set aside.
+  // Not when the transport connects by name: it might pick that address.
+  const addresses =
+    policy.pin === false ? answers : answers.filter((address) => !address.includes("%"));
   if (
     addresses.length === 0 ||
     addresses.some((address) => refusesAddress(address, allowPrivate))

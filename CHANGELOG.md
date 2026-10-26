@@ -35,6 +35,10 @@ How it works:
 - `install.sh` and `install.ps1` now validate the release version, asset filename and SHA-256 from release metadata before building download URLs or downloading the binary, preventing malformed metadata from retargeting installer requests. Checksum comparison accepts either hexadecimal letter case. See [Installation](https://docs.squirrelscan.com/getting-started/installation).
 - HTML report issue cards now show each detected technology badge once, preserving the order in which distinct technologies first appear (#1093).
 
+### Security
+
+- **A redirect found while crawling the audited site can no longer send the CLI to a cloud metadata or link-local address.** The page crawl, the root files (robots.txt, sitemaps, llms.txt, the well-known and markdown probes) and the internal link check now refuse a redirect hop that leaves the site's hosts for an address such as `169.254.169.254`, `fe80::/10` or `metadata.google.internal`, before sending it, as the asset checks already did. A sitemap that robots.txt or a sitemap index names at such an address is not requested either, and the `security/http-to-https` rule checks the address of each redirect it follows the same way. Private networks stay allowed, so `localhost`, LAN and staging audits still crawl their own pages and root files. Redirects of the start URL itself, resolved before the crawl begins, are not covered yet ([follow_redirects](https://docs.squirrelscan.com/configuration/crawler#follow_redirects)).
+
 ## v0.0.133 (2026-10-24)
 
 White-label reports get a website and a footer, and the docs get a report walkthrough.
