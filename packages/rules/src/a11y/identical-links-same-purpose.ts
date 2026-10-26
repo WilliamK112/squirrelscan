@@ -2,14 +2,54 @@
 
 import type { CheckResult, Rule, RuleContext, RuleResult } from "../types";
 
+const MAX_CONTEXT_ANCESTORS = 64;
+const MAX_LABELLED_BY_IDS = 8;
+
+function normalizedText(value: string | null | undefined): string {
+  return value?.replace(/\s+/g, " ").trim().toLowerCase() ?? "";
+}
+
+function linkContext(link: Element, doc: Document): string {
+  let ancestor = link.parentElement;
+
+  for (let depth = 0; ancestor && depth < MAX_CONTEXT_ANCESTORS; depth++) {
+    const labelledBy = ancestor.getAttribute("aria-labelledby");
+    if (labelledBy) {
+      const label = labelledBy
+        .trim()
+        .split(/\s+/)
+        .slice(0, MAX_LABELLED_BY_IDS)
+        .map((id) => normalizedText(doc.getElementById(id)?.textContent))
+        .filter(Boolean)
+        .join(" ");
+      if (label) return label;
+    }
+
+    const ariaLabel = normalizedText(ancestor.getAttribute("aria-label"));
+    if (ariaLabel) return ariaLabel;
+
+    if (ancestor.tagName.toLowerCase() === "li") {
+      const leadingLink = ancestor.querySelector("a[href]");
+      if (leadingLink && leadingLink !== link) {
+        const label = normalizedText(leadingLink.textContent);
+        if (label) return label;
+      }
+    }
+
+    ancestor = ancestor.parentElement;
+  }
+
+  return "";
+}
+
 export const identicalLinksSamePurposeRule: Rule = {
   meta: {
     id: "a11y/identical-links-same-purpose",
     name: "Identical Links Same Purpose",
     description:
-      "Checks that links with identical text go to the same destination",
+      "Checks that links with identical text in the same context go to the same destination",
     solution:
-      "Links with the same visible text should go to the same URL. When identical link text leads to different destinations, it confuses screen reader users who navigate by listing links. Make link text unique or more descriptive to differentiate destinations.",
+      "Links with the same visible text in the same programmatic context should go to the same URL. When identical link text leads to different destinations, it confuses screen reader users who navigate by listing links. Make link text unique or more descriptive, or label distinct navigation sections with aria-label or aria-labelledby.",
     category: "a11y",
     scope: "page",
     verdictScope: "page",
@@ -23,10 +63,10 @@ export const identicalLinksSamePurposeRule: Rule = {
     const checks: CheckResult[] = [];
 
     const links = doc.querySelectorAll("a[href]");
-    const linksByText = new Map<string, Set<string>>();
+    const linkGroups = new Map<string, { text: string; context: string; hrefs: Set<string> }>();
 
     for (const link of links) {
-      const text = link.textContent?.trim().toLowerCase();
+      const text = normalizedText(link.textContent);
       const href = link.getAttribute("href");
 
       if (!text || !href) continue;
@@ -40,21 +80,24 @@ export const identicalLinksSamePurposeRule: Rule = {
       // Remove query strings for basic comparison
       const baseHref = normalizedHref.split("?")[0];
 
-      if (!linksByText.has(text)) {
-        linksByText.set(text, new Set());
+      const context = linkContext(link, doc);
+      const groupKey = JSON.stringify([text, context]);
+      let group = linkGroups.get(groupKey);
+      if (!group) {
+        group = { text, context, hrefs: new Set() };
+        linkGroups.set(groupKey, group);
       }
-      linksByText.get(text)?.add(baseHref);
+      group.hrefs.add(baseHref);
     }
 
     const inconsistentLinks: string[] = [];
 
-    for (const [text, hrefs] of linksByText) {
+    for (const { text, context, hrefs } of linkGroups.values()) {
       if (hrefs.size > 1) {
         // Same text, different destinations
         const destinations = Array.from(hrefs);
-        inconsistentLinks.push(
-          `"${text}" → ${destinations.length} different URLs`
-        );
+        const contextLabel = context ? ` in "${context}"` : "";
+        inconsistentLinks.push(`"${text}"${contextLabel} → ${destinations.length} different URLs`);
       }
     }
 
@@ -66,9 +109,7 @@ export const identicalLinksSamePurposeRule: Rule = {
         items: inconsistentLinks.slice(0, 10).map((id) => ({ id })),
         details: {
           suggestion: "Make link text unique to differentiate destinations",
-          ...(inconsistentLinks.length > 10
-            ? { additional: inconsistentLinks.length - 10 }
-            : {}),
+          ...(inconsistentLinks.length > 10 ? { additional: inconsistentLinks.length - 10 } : {}),
         },
       });
     } else if (links.length > 0) {
