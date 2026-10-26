@@ -123,6 +123,19 @@ export const orphanPagesRule: Rule = {
     const minLinks = options.minInboundLinks as number;
     const excludePatterns = options.excludePatterns as string[];
 
+    // A capped crawl cannot prove that a page has too few inbound links: an
+    // uncrawled page may contain the links that would put it over the threshold.
+    const limits = ctx.site?.crawlLimits;
+    if (limits && limits.pagesCrawled >= limits.maxPages) {
+      checks.push({
+        name: "orphan-pages",
+        status: "skipped",
+        message: `Crawl stopped at its ${limits.maxPages}-page cap, so an inbound link may sit on a page not crawled`,
+        skipReason: "Crawl capped before the frontier was exhausted",
+      });
+      return { checks };
+    }
+
     // Streaming path (#1022): read pre-materialized incoming-link counts instead
     // of holding every parsed page resident. `incomingLinkCounts()` is keyed by
     // each crawled page's stored URL (crawl order) with its dofollow internal

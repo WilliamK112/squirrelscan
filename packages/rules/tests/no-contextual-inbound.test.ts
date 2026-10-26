@@ -202,10 +202,12 @@ describe("links/no-contextual-inbound — a capped crawl", () => {
   }
 
   test("skips when the crawl stopped at its page cap", () => {
-    const result = check(noContextualInboundRule, capped(4, 4));
-    expect(result.status).toBe("skipped");
-    expect(result.skipReason).toBe("Crawl capped before the frontier was exhausted");
-    expect(result.items).toBeUndefined();
+    for (const rule of [noContextualInboundRule, orphanPagesRule, weakInternalLinksRule]) {
+      const result = check(rule, capped(4, 4));
+      expect(result.status).toBe("skipped");
+      expect(result.skipReason).toBe("Crawl capped before the frontier was exhausted");
+      expect(result.items).toBeUndefined();
+    }
   });
 
   test("still warns when the crawl finished under its cap", () => {

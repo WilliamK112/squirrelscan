@@ -144,7 +144,8 @@ function parseLinks(parsedData: string | null): LinkData[] {
 async function runBothWays(
   store: SQLiteStorage,
   rule: Rule,
-  options: Record<string, unknown>
+  options: Record<string, unknown>,
+  crawlLimits?: { pagesCrawled: number; maxPages: number }
 ) {
   const pages = await run(store.getPages(CRAWL));
   const sitePages = pages.map((p) => ({
@@ -162,7 +163,13 @@ async function runBothWays(
 
   const legacyCtx: RuleContext = {
     ...base,
-    site: { baseUrl: BASE, pages: sitePages, robotsTxt: null, sitemaps: null },
+    site: {
+      baseUrl: BASE,
+      pages: sitePages,
+      robotsTxt: null,
+      sitemaps: null,
+      ...(crawlLimits ? { crawlLimits } : {}),
+    },
   };
   const legacy = (await Promise.resolve(rule.run(legacyCtx))).checks;
 
@@ -170,7 +177,13 @@ async function runBothWays(
   const streamedCtx: RuleContext = {
     ...base,
     // EMPTY pages — the streaming path must not read them.
-    site: { baseUrl: BASE, pages: [], robotsTxt: null, sitemaps: null },
+    site: {
+      baseUrl: BASE,
+      pages: [],
+      robotsTxt: null,
+      sitemaps: null,
+      ...(crawlLimits ? { crawlLimits } : {}),
+    },
     siteQuery,
   };
   const streamed = (await Promise.resolve(rule.run(streamedCtx))).checks;
@@ -426,6 +439,49 @@ describe("SiteQuery dual-path — links/no-contextual-inbound", () => {
 });
 
 describe("SiteQuery dual-path — edge cases parity", () => {
+  test("a capped crawl skips both inbound-count rules on both paths", async () => {
+    const store = await freshStore();
+    await seedFixture(store);
+
+    for (const [rule, options, name] of [
+      [orphanRule, { minInboundLinks: 2, excludePatterns: [] }, "orphan-pages"],
+      [weakRule, { excludePatterns: [] }, "weak-internal-links"],
+    ] as const) {
+      const { legacy, streamed } = await runBothWays(store, rule, options, {
+        pagesCrawled: FIXTURE.length,
+        maxPages: FIXTURE.length,
+      });
+      expect(streamed).toEqual(legacy);
+      expect(legacy).toEqual([
+        {
+          name,
+          status: "skipped",
+          message: `Crawl stopped at its ${FIXTURE.length}-page cap, so an inbound link may sit on a page not crawled`,
+          skipReason: "Crawl capped before the frontier was exhausted",
+        },
+      ]);
+    }
+    await run(store.close());
+  });
+
+  test("a crawl that finishes under its cap still warns on both inbound-count rules", async () => {
+    const store = await freshStore();
+    await seedFixture(store);
+
+    for (const [rule, options, name] of [
+      [orphanRule, { minInboundLinks: 2, excludePatterns: [] }, "orphan-pages"],
+      [weakRule, { excludePatterns: [] }, "weak-internal-links"],
+    ] as const) {
+      const { legacy, streamed } = await runBothWays(store, rule, options, {
+        pagesCrawled: FIXTURE.length,
+        maxPages: FIXTURE.length + 1,
+      });
+      expect(streamed).toEqual(legacy);
+      expect(legacy[0]).toMatchObject({ name, status: "warn" });
+    }
+    await run(store.close());
+  });
+
   test("a crawl with <2 pages skips identically on both paths", async () => {
     const store = await freshStore();
     await run(store.upsertPage(CRAWL, pageRow(BASE, [link("/a")])));
