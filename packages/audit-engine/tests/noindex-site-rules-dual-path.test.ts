@@ -30,6 +30,8 @@ interface Spec {
   normalizedUrl: string;
   title: string;
   description: string;
+  wordCount?: number;
+  pageType?: string;
   robots: string | null;
   xRobotsTag: string | null;
   links: string[];
@@ -145,8 +147,8 @@ function feat(s: Spec): PageFeatureRow {
     description: s.description,
     descHash: `h:${s.description.toLowerCase()}`,
     contentHash: null,
-    wordCount: null,
-    pageType: null,
+    wordCount: s.wordCount ?? null,
+    pageType: s.pageType ?? null,
     schemaTypes: [],
     robotsNoindex: isNoindex(s),
     canonical: null,
@@ -187,6 +189,8 @@ function legacyPages(fixture: Spec[] = FIXTURE) {
     statusCode: 200,
     parsed: {
       meta: { title: s.title, description: s.description, robots: s.robots },
+      content: { wordCount: s.wordCount ?? null },
+      pageType: s.pageType ?? null,
       links: s.links.map(link),
     } as unknown as ParsedPage,
     headers: s.xRobotsTag ? { "x-robots-tag": s.xRobotsTag } : {},
@@ -207,7 +211,13 @@ async function runBothWays(
   };
   const legacyCtx: RuleContext = {
     ...base,
-    site: { baseUrl: BASE, pages: legacyPages(fixture), robotsTxt: null, sitemaps: null, siteIndexable },
+    site: {
+      baseUrl: BASE,
+      pages: legacyPages(fixture),
+      robotsTxt: null,
+      sitemaps: null,
+      siteIndexable,
+    },
   };
   const legacy = (await Promise.resolve(rule.run(legacyCtx))).checks;
 
@@ -276,14 +286,17 @@ describe("noindex pages are left out of the site rules, identically on both path
 // content/title-pattern-outlier (pub#488): 12 catalogue pages share one template and
 // two noindex pages (one meta, one X-Robots-Tag header) carry short titles.
 const OUTLIER_FIXTURE: Spec[] = [
-  ...Array.from({ length: 12 }, (_, i): Spec => ({
-    normalizedUrl: `https://example.com/p${String(i + 1).padStart(2, "0")}.html`,
-    title: `Product number ${i + 1} in our catalogue | Brand`,
-    description: `Product ${i + 1}`,
-    robots: null,
-    xRobotsTag: null,
-    links: [],
-  })),
+  ...Array.from(
+    { length: 12 },
+    (_, i): Spec => ({
+      normalizedUrl: `https://example.com/p${String(i + 1).padStart(2, "0")}.html`,
+      title: `Product number ${i + 1} in our catalogue | Brand`,
+      description: `Product ${i + 1}`,
+      robots: null,
+      xRobotsTag: null,
+      links: [],
+    }),
+  ),
   {
     normalizedUrl: "https://example.com/campaign-terms.html",
     title: "Terms",
@@ -317,6 +330,63 @@ describe("content/title-pattern-outlier leaves noindex pages out, identically on
       expect(counted.legacy[0]?.status).toBe("warn");
       expect(counted.legacy[0]?.items?.[0]?.id).toBe("brand-missing:");
     }
+
+    await run(store.close());
+  });
+});
+
+const THIN_FIXTURE: Spec[] = [
+  ...Array.from(
+    { length: 10 },
+    (_, i): Spec => ({
+      normalizedUrl: i === 0 ? BASE : `https://example.com/article-${i}`,
+      title: `Article ${i}`,
+      description: `Article ${i}`,
+      wordCount: 1800,
+      pageType: "article",
+      robots: null,
+      xRobotsTag: null,
+      links: [],
+    }),
+  ),
+  {
+    normalizedUrl: "https://example.com/short-header",
+    title: "Short header",
+    description: "Short header",
+    wordCount: 350,
+    pageType: "article",
+    robots: null,
+    xRobotsTag: "noindex",
+    links: [],
+  },
+  {
+    normalizedUrl: "https://example.com/short-meta",
+    title: "Short meta",
+    description: "Short meta",
+    wordCount: 400,
+    pageType: "article",
+    robots: "noindex,follow",
+    xRobotsTag: null,
+    links: [],
+  },
+].sort((a, b) => (a.normalizedUrl < b.normalizedUrl ? -1 : 1));
+
+describe("content/thin-vs-site-norm leaves noindex pages out, identically on both paths", () => {
+  test("excluded on an indexed site, judged otherwise", async () => {
+    const store = await seededStore(THIN_FIXTURE);
+    const rule = rules.get("content/thin-vs-site-norm")!;
+
+    const skipped = await runBothWays(store, rule, true, {}, THIN_FIXTURE);
+    expect(JSON.stringify(skipped.streamed)).toBe(JSON.stringify(skipped.legacy));
+    expect(skipped.legacy[0]?.status).toBe("pass");
+    expect(skipped.legacy[0]?.details?.judgedPages).toBe(10);
+    expect(skipped.legacy[0]?.details?.skippedNoindexPages).toBe(2);
+
+    const counted = await runBothWays(store, rule, false, {}, THIN_FIXTURE);
+    expect(JSON.stringify(counted.streamed)).toBe(JSON.stringify(counted.legacy));
+    expect(counted.legacy[0]?.status).toBe("warn");
+    expect(counted.legacy[0]?.details?.flaggedPages).toBe(2);
+    expect(counted.legacy[0]?.details?.skippedNoindexPages).toBe(0);
 
     await run(store.close());
   });

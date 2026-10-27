@@ -27,6 +27,8 @@ How it works:
 
 ### Changed
 
+- Noindex pages no longer affect `content/thin-vs-site-norm` on an indexed site: they are left out of each page type's median and cannot be reported as thin outliers. The check details count the pages left out. A staging or preview site whose homepage is noindex still checks every page. See [Thin against your own site](https://docs.squirrelscan.com/rules/content/thin-vs-site-norm) (#1029).
+
 - Broken links are reported as a reliability problem, not an SEO one. `links/broken-links`, `links/broken-external-links` and `links/broken-anchors` move from the Links category to Reliability, so they no longer count toward the SEO score. Reliability rolls up into the Performance score, which now carries them. Their badge on the HTML report reads **Reliability**, as do the badges of `reliability/broken-resources` and `reliability/broken-forms`, which used to read Performance. The rule ids keep their `links/` prefix, so configs, `links/*` patterns, `rule_options` and docs links keep working. `reliability/*` does not select the three rules, so list them by id to disable them with it. `squirrel report --category reliability` now includes them, and a report stored before this release keeps them under `links`. See [Reliability](https://docs.squirrelscan.com/rules/reliability).
 
 ### Security

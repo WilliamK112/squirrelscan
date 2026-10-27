@@ -23,6 +23,8 @@ Four guards apply in order. The site needs 10 crawled pages. A page type needs 8
 
 Only pages that returned a 2xx status and carry a known page type are sampled.
 
+On an indexed site, pages marked `noindex` are left out of the groups: they do not affect the median and are not reported as outliers. The check's `details.skippedNoindexPages` records how many were left out. When the homepage is itself noindex, as on a staging or preview deployment, nothing is skipped; see [pages kept out of search](/rules#pages-kept-out-of-search).
+
 Pages below 300 words are never reported here, because `content/word-count` owns them, but they do still count toward their group's size, median, deviation and agreement, and toward the judged-page total in the message. Severity warning, weight 3.
 
 ## How to fix it
