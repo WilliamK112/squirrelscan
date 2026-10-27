@@ -20,6 +20,7 @@ How it works:
 ### Docs
 
 - **The Performance rules page counts 5 Reliability rules.** The card said 2 after the broken-link rules moved into the category.
+- **Rule-option examples use the table the CLI reads.** Fourteen rule-reference pages now put per-rule settings under `[rule_options."<id>"]`, not the ignored `[rules."<id>"]`. The docs check rejects the ignored table so copied examples keep changing audit behavior. (#1176)
 
 ## v0.0.137 (2026-10-28)
 

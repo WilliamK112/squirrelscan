@@ -84,7 +84,7 @@ The note says "may" because squirrel only sees what Cloudflare sent, not what yo
 ### Configuration example
 
 ```toml squirrel.toml
-[rules."perf/bad-caching"]
+[rule_options."perf/bad-caching"]
 min_freshness_ratio = 0.6
 min_validator_ratio = 0.6
 min_compression_ratio = 0.8
