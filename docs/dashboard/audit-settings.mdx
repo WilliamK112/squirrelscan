@@ -36,7 +36,7 @@ Some rules are powered by [cloud services](/cloud/rules). Most are included in t
 
 A separate card toggles **external link checking** for cloud audits. When on, audits verify that outbound links resolve, using the [dead-links service](/rules/links/dead-links). It is the same setting as **External link checks** in the site's [audit level](/dashboard/crawl-settings#audit-level), so the two always agree: on at every level, Quick included, and for a site added before audit levels, unless you turn it off. Change it on a site that is on a level and the site becomes Custom. Each distinct external link a cloud audit can verify costs 1 credit, whether it works or is broken, and the same link on many pages is checked and charged once. A link behind a bot wall or a throttle, which the report lists as unverified, costs nothing, and internal links are free. An audit is charged for at most one external link per page of its page budget, so [Max credits per audit](#max-credits-per-audit) caps link checks too. The card links to your org's credit usage.
 
-Turn it off and this website's audits skip external links until you turn it back on or choose a preset level. [Broken link alerts](/dashboard/emails#broken-link-alerts) are a separate setting, under **Website → Settings → Alerts**.
+Turn it off and this website's audits skip external links until you turn it back on or choose a preset level. [Broken link alerts](/dashboard/emails#new-broken-links) are a separate setting, under **Website → Settings → Alerts**.
 
 ## Max credits per audit
 
@@ -50,7 +50,7 @@ The estimate is an upper bound: the audit is billed as it runs (50 credits base 
 
 ## Email notifications
 
-A sibling page, **Website → Settings → Alerts**, holds the **Email notifications** toggle for this website. It controls the audit completion email, the audit failure email, and the [scheduled-audit digest](/cloud/scheduled-audits).
+A sibling page, **Website → Settings → Alerts**, holds the **Email notifications** toggle for this website. It controls the audit completion email, the audit failure email, the [scheduled-audit digest](/cloud/scheduled-audits), and, on Pro and Team, [broken link alerts](/dashboard/emails#new-broken-links), which also have their own **Broken link alerts** switch on that page.
 
 A few emails are account level and arrive whatever this toggle says, including the low-credit warning and the notice that a website's recurring audits paused themselves. [Emails we send](/dashboard/emails) lists every automatic email, what triggers it, and where its off switch is.
 
