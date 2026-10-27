@@ -10,10 +10,17 @@ import type {
   SitemapUrl,
 } from "@squirrelscan/core-contracts";
 import { createHeaderScope, mergeHeaderRecords, type HeaderScope } from "@squirrelscan/utils/headers";
-import type { EgressPolicy } from "@squirrelscan/utils/public-egress";
+import {
+  EGRESS_OFF_SITE_REFUSAL,
+  EgressRefusedError,
+  type EgressPolicy,
+} from "@squirrelscan/utils/public-egress";
 import { resolveRobotsSitemapUrl } from "@squirrelscan/utils/robots-txt";
 
-import { SITEMAP_NOT_CHECKED_ERROR } from "@squirrelscan/core-contracts/storage";
+import {
+  SITEMAP_NOT_CHECKED_ERROR,
+  SITEMAP_OFF_SITE_SKIPPED_ERROR,
+} from "@squirrelscan/core-contracts/storage";
 
 import { safeFetchWithDeadline } from "./deadline";
 import { noteRefusal, type RefusalLog } from "./refusals";
@@ -770,6 +777,12 @@ export function fetchSitemap(
         egress,
       );
     } catch (error) {
+      // #819: a sitemap on the site that redirects to another host is not
+      // followed there (an offline audit). Nothing was requested off the site,
+      // so it is skipped, not a sitemap that failed to load.
+      if (error instanceof EgressRefusedError && error.message === EGRESS_OFF_SITE_REFUSAL) {
+        return { success: false, url, error: SITEMAP_OFF_SITE_SKIPPED_ERROR, settled: true };
+      }
       return {
         success: false,
         url,
@@ -989,6 +1002,15 @@ export interface DiscoverSitemapsOptions {
   egress?: EgressPolicy;
 }
 
+/** A URL's host as `EgressPolicy.allowHost` reads it: lowercase, IPv6 without brackets. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return "";
+  }
+}
+
 export function discoverSitemaps(
   baseUrl: string,
   robotsTxt: RobotsTxtData | null,
@@ -998,6 +1020,7 @@ export function discoverSitemaps(
   return Effect.gen(function* () {
     const sitemapUrls = new Set<string>();
     const robotsSitemaps = new Set<string>();
+    const offSiteSkipped = new Set<string>();
 
     // #1393: robots.txt is untrusted page content. A `Sitemap:` directive can
     // carry any scheme/host, so `resolveRobotsSitemapUrl` rejects non-http(s)
@@ -1013,6 +1036,13 @@ export function discoverSitemaps(
         const resolvedUrl = resolveRobotsSitemapUrl(sitemap, baseUrl).url;
         if (resolvedUrl === null) {
           logger.debug(`Unusable sitemap URL in robots.txt skipped: ${sitemap}`);
+          continue;
+        }
+        // #819: an own-site-only (offline) audit never requests a sitemap on
+        // another host. It is recorded as skipped, so the report does not read
+        // it as a sitemap that failed to load or does not exist.
+        if (options.egress?.allowHost && !options.egress.allowHost(hostOf(resolvedUrl))) {
+          offSiteSkipped.add(resolvedUrl);
           continue;
         }
         sitemapUrls.add(resolvedUrl);
@@ -1090,6 +1120,9 @@ export function discoverSitemaps(
     const unvisited = entryPoints.filter((url) => !attempted.has(url));
     for (const url of unvisited) {
       failed.push({ url, source: sourceOf(url), error: SITEMAP_NOT_REACHED_ERROR });
+    }
+    for (const url of offSiteSkipped) {
+      failed.push({ url, source: "robots.txt", error: SITEMAP_OFF_SITE_SKIPPED_ERROR });
     }
 
     return {
