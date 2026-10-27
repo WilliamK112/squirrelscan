@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { parseHTML } from "@squirrelscan/parser/dom";
 
-import { keywordStuffingRule } from "../src/content/keyword-stuffing";
+import { keywordStuffingRule, keywordTokens } from "../src/content/keyword-stuffing";
 import type { ParsedPage, RuleContext } from "../src/types";
 
 function ctx(html: string, options: Record<string, unknown> = {}): RuleContext {
@@ -178,6 +178,120 @@ describe("content/keyword-stuffing language stop words (#1042)", () => {
 
   test("an unknown page language keeps the English exclusions", () => {
     const html = `<html lang="xx"><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("pass");
+  });
+});
+
+describe("content/keyword-stuffing main copy and Unicode words (#1182)", () => {
+  test("navigation and header links outside main content do not affect density", () => {
+    const links = Array.from(
+      { length: 20 },
+      (_, index) => `<a href="/${index}">Bademode ${FILLER_BANK[index]}</a>`,
+    ).join("\n");
+    const html = `<html lang="de"><body><header><nav>${links}</nav></header><main><p>${filler(120)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("pass");
+    expect(checks[0].items?.some((item) => item.id === "bademode")).not.toBe(true);
+  });
+
+  test("commercial anchor text inside main content still flags", () => {
+    const links = Array.from({ length: 12 }, () => '<a href="/plumber">Emergency Plumber</a>').join(
+      "\n",
+    );
+    const html = `<html><body><header><nav><a href="/">Home</a></nav></header><main>${links}<p>${filler(100)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "plumber")).toBe(true);
+  });
+
+  test("a thin main falls back to substantial body copy", () => {
+    const html = `<html><body><main><p>Short introduction only</p></main><section><p>${"widget ".repeat(20)}${filler(120)}</p></section></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+  });
+
+  test("the largest substantial main landmark is measured", () => {
+    const html = `<html><body><main><p>${filler(100)}</p></main><main><p>${"widget ".repeat(20)}${filler(100)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+  });
+
+  test("thousands of nested main landmarks stay within a bounded scan", { timeout: 30_000 }, () => {
+    const depth = 5_000;
+    const html = `<html><body>${"<main>".repeat(depth)}<p>${filler(120)}</p>${"</main>".repeat(depth)}</body></html>`;
+    const context = ctx(html);
+    const started = performance.now();
+    const { checks } = keywordStuffingRule.run(context);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(checks[0].status).toBe("pass");
+  });
+
+  test("a listing without main keeps every article", () => {
+    const html = `<html><body><article><p>${filler(100)}</p></article><article><p>${"widget ".repeat(20)}${filler(20)}</p></article></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+  });
+
+  test("an article inside a sidebar is not selected as the page's main copy", () => {
+    const html = `<html><body><aside><article><p>${filler(100)}</p></article></aside><section><p>${"widget ".repeat(20)}${filler(100)}</p></section></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+  });
+
+  test("a thin sole article falls back to the rest of the body", () => {
+    const html = `<html><body><article><p>Short article</p></article><section><p>${"widget ".repeat(20)}${filler(120)}</p></section></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+  });
+
+  test("article headers remain part of body-fallback copy", () => {
+    const html = `<html><body><header>${"global ".repeat(30)}</header><article><header>${"widget ".repeat(20)}</header><p>${filler(100)}</p></article><article><p>${filler(20)}</p></article></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+    expect(checks[0].items?.some((item) => item.id === "global")).not.toBe(true);
+  });
+
+  test("umlauts, ß and decomposed letters stay in one normalized word", () => {
+    expect(keywordTokens("gemäß gema\u0308ß Straße")).toEqual(["gemäß", "gemäß", "straße"]);
+    const html = `<html lang="de"><body><main><p>${"gemäß ".repeat(15)}${filler(120)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].items?.some((item) => item.id === "gemäß")).toBe(true);
+    expect(checks[0].items?.some((item) => item.id === "gem")).toBe(false);
+  });
+
+  test("German price-note boilerplate is ignored", () => {
+    const notes = "inkl MwSt zzgl Versandkosten ".repeat(12);
+    const html = `<html lang="de"><body><main><p>${notes}${filler(120)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("pass");
+  });
+
+  test("English price-note boilerplate is ignored", () => {
+    const html = `<html lang="en"><body><main><p>${"incl VAT ".repeat(12)}${filler(120)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("pass");
+  });
+
+  test("a token longer than the item limit is ignored instead of split", () => {
+    const longToken = "ä".repeat(80);
+    expect(keywordTokens(`${longToken} normal`)).toEqual(["normal"]);
+  });
+
+  test("compatibility normalization is bounded to one short token", () => {
+    expect(keywordTokens("ａｃｍｅ ﬀoo gemäß")).toEqual(["acme", "ffoo", "gemäß"]);
+    expect(keywordTokens(`${"\uFDFA.".repeat(2_000)} normal`)).toEqual(["normal"]);
+  });
+
+  test("Han, Kana and Hangul runs are not treated as whole words", () => {
+    expect(keywordTokens("検索検索 검색검색 カタカナカタカナ normal")).toEqual(["normal"]);
+    const html = `<html lang="ja"><body><main><p>${"検索検索。".repeat(30)}${filler(120)}</p></main></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
     expect(checks[0].status).toBe("pass");
   });
