@@ -11,6 +11,7 @@
 // renderer.
 
 import type { EntityMap, EntityMapEdge, EntityMapNode } from "./types";
+import { escapeMarkdownText, markdownCodeSpan } from "./output/markdown-escape";
 
 /** Entities listed in a format's entity table. */
 export const ENTITY_TABLE_LIMIT = 25;
@@ -153,10 +154,27 @@ const MAX_CELL = 90;
  * LIVE pipe and the row gains a column.
  */
 export function entityCell(value: string | null | undefined): string {
+  // #3522: the site's own JSON-LD (names, ids, types, conflicting values), so
+  // brackets, `!`, `<` and backticks are escaped as well as the pipe.
+  return escapeMarkdownText(clipCell(value));
+}
+
+/**
+ * A value as a code span inside a table cell, fenced past any backtick run. A
+ * GFM table splits on a pipe even inside a span, and a backslash before it does
+ * not help: the code span shows backslashes as typed, and a value that already
+ * holds `\|` would still split. So each `|` is shown as `¦` (U+00A6), which
+ * keeps the cell whole whatever the value holds.
+ */
+export function entityCodeCell(value: string | null | undefined): string {
+  return markdownCodeSpan(clipCell(value).replace(/\|/g, "\u00a6"));
+}
+
+/** A value flattened to one line and clipped to {@link MAX_CELL}, not yet escaped. */
+function clipCell(value: string | null | undefined): string {
   if (!value) return "";
   const flat = value.replace(/\s+/g, " ").trim();
-  const clipped = flat.length > MAX_CELL ? `${flat.slice(0, MAX_CELL - 1)}…` : flat;
-  return clipped.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
+  return flat.length > MAX_CELL ? `${flat.slice(0, MAX_CELL - 1)}…` : flat;
 }
 
 function tail(shown: number, total: number, noun: string): string[] {
@@ -240,7 +258,7 @@ export function entityMarkdownSection(map: EntityMap, heading = "##"): string[] 
       );
       for (const conflict of node.conflicts) {
         lines.push(
-          `  - \`${entityCell(conflict.property)}\` has ${conflict.values.length} values:`,
+          `  - ${markdownCodeSpan(clipCell(conflict.property))} has ${conflict.values.length} values:`,
         );
         for (const value of conflict.values) {
           const pages = value.pages.length + value.morePages;

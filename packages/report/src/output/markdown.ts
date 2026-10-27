@@ -43,6 +43,14 @@ import { getPathname } from "../url";
 import { lockedRulesMessage } from "../locked-rules";
 import { privateTargetLine } from "../private-target";
 import { notCheckedLines } from "../not-checked";
+import {
+  escapeHtmlText,
+  escapeMarkdownCell,
+  escapeMarkdownDestination,
+  escapeMarkdownText,
+  markdownCodeSpan,
+  markdownLink,
+} from "./markdown-escape";
 
 /** repo#2661: ", N more not listed" when the report left items out of a check. */
 function notListedSuffix(check: Parameters<typeof itemsNotListed>[0]): string {
@@ -56,32 +64,6 @@ export interface MarkdownRenderOptions {
   branding?: ReportBranding;
   /** List the rules that passed after the issues (`--include-passed`). */
   includePassed?: boolean;
-}
-
-function escapeMarkdownTableCell(value: string, escapeBrackets = false): string {
-  const output: string[] = [];
-  for (let i = 0; i < value.length; i++) {
-    const char = value[i];
-    if (char === "\\") output.push("\\\\");
-    else if (char === "|") output.push("\\|");
-    else if (escapeBrackets && (char === "[" || char === "]")) output.push(`\\${char}`);
-    else if (char === "\r" || char === "\n") {
-      if (char === "\r" && value[i + 1] === "\n") i++;
-      output.push("<br>");
-    } else output.push(char);
-  }
-  return output.join("");
-}
-
-function escapeMarkdownDestination(value: string): string {
-  const output: string[] = [];
-  for (const char of value) {
-    if (char === "\\") output.push("%5C");
-    else if (char === "(") output.push("%28");
-    else if (char === ")") output.push("%29");
-    else output.push(char);
-  }
-  return output.join("");
 }
 
 /**
@@ -139,7 +121,7 @@ function escapeMarkdownInline(value: string): string {
 }
 
 function siteProfileMarkdownValue(value: string, rawUrl?: string): string {
-  const label = escapeMarkdownTableCell(value, true);
+  const label = escapeMarkdownCell(value);
   if (!rawUrl) return label;
   try {
     const url = new URL(rawUrl);
@@ -175,7 +157,8 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
       : "# squirrelscan Audit Report",
   );
   lines.push("");
-  lines.push(`**URL:** ${report.baseUrl}  `);
+  // #3522: escaped, like every value below that a site or a stored report chose.
+  lines.push(`**URL:** ${escapeMarkdownText(report.baseUrl)}  `);
   lines.push(`**Date:** ${formatReportDate(report.timestamp)}  `);
   lines.push(`**Pages:** ${report.totalPages}  `);
   // #1829: the caveat on the page count above — coverage lost to throttling.
@@ -318,7 +301,8 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
   } else if (report.healthScore) {
     // #1829: a partial run keeps its grade; flag the coverage gap above it.
     if (report.status === "partial" && report.statusReason) {
-      lines.push(`> **Partial audit:** ${report.statusReason}`);
+      // Escaped like the Failed branch's reason above, for the same reason (#3522).
+      lines.push(`> **Partial audit:** ${escapeMarkdownText(report.statusReason)}`);
       lines.push("");
     }
     lines.push("## Health Score");
@@ -355,7 +339,7 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
       lines.push(`| ${row.label} | ${value} |`);
     }
     const flags = siteProfileFlags(report.siteMetadata);
-    if (flags) lines.push(`| Flags | ${escapeMarkdownTableCell(flags)} |`);
+    if (flags) lines.push(`| Flags | ${escapeMarkdownCell(flags)} |`);
     lines.push("");
   }
 
@@ -373,9 +357,12 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
     for (const group of groupTechnologies(tech.items)) {
       const cells = group.items.map((t) => {
         const url = techIconUrl(t.icon);
-        const logo = url ? `<img src="${url}" alt="${t.name}" width="14" height="14" /> ` : "";
-        const ver = t.version ? ` \`${t.version}\`` : "";
-        return `${logo}${t.name}${ver}`;
+        const logo = url
+          ? `<img src="${url}" alt="${escapeHtmlText(t.name)}" width="14" height="14" /> `
+          : "";
+        // The version is read off the audited site (#3522): fenced so it cannot close the span.
+        const ver = t.version ? ` ${markdownCodeSpan(t.version)}` : "";
+        return `${logo}${escapeMarkdownText(t.name)}${ver}`;
       });
       lines.push(`**${group.emoji} ${group.label}**  `);
       lines.push(cells.join(" · "));
@@ -485,8 +472,12 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
       lines.push("|-------|--------|---------|");
       for (const check of rule.checks) {
         const statusIcon = check.status === "fail" ? "X" : "!";
-        const escapedMessage = escapeMarkdownTableCell(check.message + carriedTag(check));
-        lines.push(`| ${check.name} | ${statusIcon} ${check.status} | ${escapedMessage} |`);
+        // #3522: a message and a check name can embed what the page said (an ad
+        // URL, a misspelled word), so both cells are escaped, brackets included.
+        const escapedMessage = escapeMarkdownCell(check.message + carriedTag(check));
+        lines.push(
+          `| ${escapeMarkdownCell(check.name)} | ${statusIcon} ${check.status} | ${escapedMessage} |`,
+        );
       }
       lines.push("");
 
@@ -507,7 +498,7 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
               ? ap.sample.slice(0, REPORT_PAGES_HARD_CAP)
               : ap.sample;
           lines.push(
-            `<details><summary><strong>${check.name}:</strong> ${ap.count} page(s) affected</summary>`,
+            `<details><summary><strong>${escapeHtmlText(check.name)}:</strong> ${ap.count} page(s) affected</summary>`,
           );
           lines.push("");
           if (ap.count > materialized.length) {
@@ -524,7 +515,8 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
               : undefined;
           for (const page of materialized) {
             const carried = carriedPageSet?.has(page) ? " (carried)" : "";
-            lines.push(`- [${getPathname(page) || "/"}](${page})${carried}`);
+            // #3522: a page URL's path is the site's; label and destination are escaped.
+            lines.push(`- ${markdownLink(getPathname(page) || "/", page)}${carried}`);
           }
           lines.push("");
           lines.push("</details>");
@@ -538,7 +530,7 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
         const visibleItems = check.items?.filter((item) => !isRedundantPageItem(item));
         if (visibleItems && visibleItems.length > 0) {
           lines.push(
-            `<details><summary><strong>${check.name}:</strong> ${visibleItems.length} item(s)${notListedSuffix(check)}</summary>`,
+            `<details><summary><strong>${escapeHtmlText(check.name)}:</strong> ${visibleItems.length} item(s)${notListedSuffix(check)}</summary>`,
           );
           lines.push("");
           for (const item of visibleItems) {
@@ -547,11 +539,11 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
               item.id.startsWith("http://") ||
               item.id.startsWith("https://") ||
               item.id.startsWith("/");
-            const display = isUrl ? `[${label}](${item.id})` : label;
+            const display = isUrl ? markdownLink(label, item.id) : escapeMarkdownText(label);
             lines.push(`- ${display}`);
             if (item.sourcePages && item.sourcePages.length > 0) {
               for (const src of item.sourcePages.slice(0, REPORT_SOURCE_PAGES_PREVIEW)) {
-                lines.push(`  - from: [${getPathname(src) || "/"}](${src})`);
+                lines.push(`  - from: ${markdownLink(getPathname(src) || "/", src)}`);
               }
               if (item.sourcePages.length > REPORT_SOURCE_PAGES_PREVIEW) {
                 // The capped preview here is just for per-item context —
@@ -567,7 +559,7 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
           lines.push("</details>");
           lines.push("");
         } else if (itemsNotListed(check) > 0) {
-          lines.push(`**${check.name}:** ${itemsNotListedLine(itemsNotListed(check))}`);
+          lines.push(`**${escapeMarkdownText(check.name)}:** ${itemsNotListedLine(itemsNotListed(check))}`);
           lines.push("");
         }
       }
@@ -595,7 +587,7 @@ export function renderMarkdown(report: AuditReport, options?: MarkdownRenderOpti
     lines.push("|------|----------|---------|");
     for (const rule of passedRules) {
       lines.push(
-        `| ${escapeMarkdownTableCell(rule.name)} \`${rule.id}\` | ${rule.categoryName} | ${passedRuleScope(rule)} |`,
+        `| ${escapeMarkdownCell(rule.name)} \`${rule.id}\` | ${rule.categoryName} | ${passedRuleScope(rule)} |`,
       );
     }
     lines.push("");
