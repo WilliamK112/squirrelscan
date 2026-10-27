@@ -24,6 +24,8 @@
  * - No rule page's `## Options` table may print `unknown` as a type or
  *   `` `undefined` `` as a default: those rows came from a generator that could
  *   not read the option schemas (#319).
+ * - A TOML example must put per-rule settings under `[rule_options."<id>"]`,
+ *   never `[rules."<id>"]`, which the config schema ignores (#1176).
  *
  * It reads the source line by line, not through the MDX parser, so an inline link
  * whose `(target)` spans lines is not checked. The docs have none.
@@ -349,6 +351,15 @@ export function brokenOptionRows(source: string): number[] {
   return rows;
 }
 
+/** TOML tables that put per-rule options under the ignored `[rules."<id>"]` key. */
+export function ignoredRuleOptionTables(source: string): number[] {
+  const rows: number[] = [];
+  for (const [index, line] of source.split("\n").entries()) {
+    if (/^\s*\[rules\."[^"]+"\]\s*$/.test(line)) rows.push(index + 1);
+  }
+  return rows;
+}
+
 /**
  * Check the docs under `root`. `requiredAnchors` are `/route#id` strings that
  * must exist. Problems come back sorted by file, then line (pub#943): the
@@ -388,6 +399,14 @@ export function checkDocs(
 
   const problems: DocsProblem[] = [];
   for (const [route, page] of pages) {
+    for (const line of ignoredRuleOptionTables(page.source)) {
+      problems.push({
+        file: page.file,
+        line,
+        message:
+          'rule options under `[rules."<id>"]` are ignored: use `[rule_options."<id>"]`',
+      });
+    }
     for (const { target, line } of linksOf(page.source)) {
       if (
         /^[a-z][a-z0-9+.-]*:/i.test(target) ||

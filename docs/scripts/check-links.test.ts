@@ -1,7 +1,7 @@
-// #322, #649, #319: the docs check fails on a dead internal link, a dead
-// #anchor, a missing required anchor and a broken Options row, and passes the
-// same pages once they are fixed. Each test writes a small docs tree to a temp
-// dir, so no fixture page ends up in the published site.
+// #322, #649, #319, #1176: the docs check fails on a dead internal link, a dead
+// #anchor, a missing required anchor, a broken Options row and a rule option in
+// the ignored table, and passes the same pages once they are fixed. Each test
+// writes a small docs tree to a temp dir, so no fixture page is published.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -314,6 +314,22 @@ describe("checkDocs", () => {
     ].join("\n");
     expect(messages(docs({ "rules/x/y.mdx": page }))).toEqual([
       "rules/x/y.mdx:8: Options row prints `unknown` (Type) or `undefined` (Default): write its type and default from the rule's schema",
+    ]);
+  });
+
+  test("rejects per-rule options under the ignored rules table (#1176)", () => {
+    const invalid = [
+      "# Rule",
+      "",
+      "```toml squirrel.toml",
+      '[rules."core/meta-title"]',
+      "min_length = 20",
+      "```",
+    ].join("\n");
+    const valid = invalid.replace("[rules.", "[rule_options.");
+    expect(messages(docs({ "rules/x/y.mdx": valid }))).toEqual([]);
+    expect(messages(docs({ "rules/x/y.mdx": invalid }))).toEqual([
+      'rules/x/y.mdx:4: rule options under `[rules."<id>"]` are ignored: use `[rule_options."<id>"]`',
     ]);
   });
 });
