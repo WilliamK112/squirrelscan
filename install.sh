@@ -90,7 +90,7 @@ info() { echo -e "${BLUE}::${NC} $1" >&2; }
 # --- Failure reporting ----------------------------------------------------
 # On failure, fire a tiny anonymous report to the installer worker (→ Sentry)
 # so we can see when installs break in the field. Strictly opt-out via
-# NO_TELEMETRY (mirrors the CLI, apps/cli/src/self/telemetry.ts), fire-and-
+# NO_TELEMETRY or DO_NOT_TRACK=1 (mirrors the CLI, apps/cli/src/self/telemetry.ts), fire-and-
 # forget (never blocks or fails the install), and carries only coarse context
 # (os/arch/step/exit code) — never paths, env, hostname, or secrets. #1013
 # v2 adds `error_output` — the tail of the failing command's own output (#1538).
@@ -178,8 +178,10 @@ detect_libc() {
 
 report_error() {
   local step="$1" code="$2" line="${3:-}" output="${4:-}"
-  # Presence disables reporting, including an explicitly empty value.
+  # Presence of NO_TELEMETRY disables reporting, including an explicitly empty
+  # value; so does DO_NOT_TRACK=1 or true (mirrors the CLI).
   [ "${NO_TELEMETRY+x}" = x ] && return 0
+  case "${DO_NOT_TRACK:-}" in 1 | [Tt][Rr][Uu][Ee]) return 0 ;; esac
   command -v curl >/dev/null 2>&1 || return 0
 
   local os arch scrubbed="" scrubbed_output="" version_field="" libc_field=""
@@ -1361,7 +1363,7 @@ download_and_install() {
   # (self/install-meta.ts honors SQUIRREL_INSTALL_SOURCE; without it the
   # managed-dir binary self-reports as the ambiguous "binary"). A caller's own
   # value wins so wrappers (CI, package managers) can name themselves.
-  SQUIRREL_INSTALL_SOURCE="${SQUIRREL_INSTALL_SOURCE:-install.sh}" \
+  SQUIRREL_INSTALL_SOURCE="${SQUIRREL_INSTALL_SOURCE:-install-sh}" \
     "$tmpdir/squirrel" self install --bin-dir "$bin_dir" 2>&1 | tee "$self_install_log"
   local rc=${PIPESTATUS[0]}
   set -e
