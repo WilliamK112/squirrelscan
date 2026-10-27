@@ -31,6 +31,7 @@ import type { Rule, RuleContext, RuleResult, CheckResult } from "../types";
 import type { CheckItem, SiteQuery } from "@squirrelscan/core-contracts";
 
 import { WORD_COUNT_MIN_WORDS } from "./word-count";
+import { excludesNoindexPage, skipsNoindexPages } from "../shared/noindex";
 
 /** Crawl-wide page floor: below this there is no site norm to judge against. */
 export const THIN_NORM_MIN_PAGES = 10;
@@ -81,6 +82,8 @@ interface ThinPageRecord {
   status: number;
   pageType: string | null;
   wordCount: number | null;
+  /** Left out of the site norm (noindex page on an indexable site, #1029). */
+  excluded?: boolean;
 }
 
 interface ThinGroup {
@@ -92,6 +95,8 @@ interface ThinGroup {
 interface ThinRollup {
   /** Pages seen by the rule (both paths count the same universe). */
   pageCount: number;
+  /** Noindex pages deliberately left out of the norm. */
+  skippedNoindexPages: number;
   /** Pages that carry a usable (pageType, wordCount) pair. */
   sampleCount: number;
   groups: Map<string, ThinGroup>;
@@ -113,7 +118,7 @@ interface JudgedGroup {
 }
 
 function emptyRollup(): ThinRollup {
-  return { pageCount: 0, sampleCount: 0, groups: new Map() };
+  return { pageCount: 0, skippedNoindexPages: 0, sampleCount: 0, groups: new Map() };
 }
 
 /**
@@ -124,6 +129,10 @@ function emptyRollup(): ThinRollup {
 function accumulatePage(rollup: ThinRollup, record: ThinPageRecord): void {
   rollup.pageCount += 1;
 
+  if (record.excluded) {
+    rollup.skippedNoindexPages += 1;
+    return;
+  }
   if (record.status < 200 || record.status >= 300) return;
   if (record.wordCount === null || record.wordCount < 0) return;
   const pageType = record.pageType?.trim().toLowerCase();
@@ -146,8 +155,13 @@ function median(values: number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-function skip(message: string): CheckResult {
-  return { name: CHECK_NAME, status: "skipped", message };
+function skip(message: string, skippedNoindexPages?: number): CheckResult {
+  return {
+    name: CHECK_NAME,
+    status: "skipped",
+    message,
+    ...(skippedNoindexPages === undefined ? {} : { details: { skippedNoindexPages } }),
+  };
 }
 
 /**
@@ -161,7 +175,8 @@ function buildChecks(rollup: ThinRollup, sitePageCount: number): CheckResult[] {
   if (sitePageCount < THIN_NORM_MIN_PAGES) {
     return [
       skip(
-        `Only ${sitePageCount} page(s) crawled; ${THIN_NORM_MIN_PAGES} needed to establish a site norm`
+        `Only ${sitePageCount} page(s) crawled; ${THIN_NORM_MIN_PAGES} needed to establish a site norm`,
+        rollup.skippedNoindexPages,
       ),
     ];
   }
@@ -179,7 +194,7 @@ function buildChecks(rollup: ThinRollup, sitePageCount: number): CheckResult[] {
 
     // Heterogeneous groups have no norm: say nothing rather than pick a side.
     const inBand = group.wordCounts.filter(
-      (wc) => Math.abs(wc - med) <= THIN_NORM_BAND * med
+      (wc) => Math.abs(wc - med) <= THIN_NORM_BAND * med,
     ).length;
     if (inBand / group.wordCounts.length < THIN_NORM_MIN_AGREEMENT) continue;
 
@@ -207,7 +222,8 @@ function buildChecks(rollup: ThinRollup, sitePageCount: number): CheckResult[] {
   if (judged.length === 0) {
     return [
       skip(
-        `No page type has ${THIN_NORM_MIN_GROUP_PAGES}+ comparable pages with a clear word-count norm`
+        `No page type has ${THIN_NORM_MIN_GROUP_PAGES}+ comparable pages with a clear word-count norm`,
+        rollup.skippedNoindexPages,
       ),
     ];
   }
@@ -218,6 +234,7 @@ function buildChecks(rollup: ThinRollup, sitePageCount: number): CheckResult[] {
     .map((g) => `${g.pageType} ${Math.round(g.median)}`)
     .join(", ");
   const details: Record<string, unknown> = {
+    skippedNoindexPages: rollup.skippedNoindexPages,
     judgedPages,
     judgedTypes: judged.length,
     flaggedPages: outliers.length,
@@ -279,7 +296,7 @@ function buildChecks(rollup: ThinRollup, sitePageCount: number): CheckResult[] {
  * property of this seam shared with every site rule on it (see
  * content/duplicate-title), not something specific to this rule.
  */
-async function runViaSiteQuery(siteQuery: SiteQuery): Promise<RuleResult> {
+async function runViaSiteQuery(siteQuery: SiteQuery, skipNoindex: boolean): Promise<RuleResult> {
   const rollup = emptyRollup();
   for await (const row of siteQuery.pagesMatching(() => true)) {
     accumulatePage(rollup, {
@@ -287,6 +304,7 @@ async function runViaSiteQuery(siteQuery: SiteQuery): Promise<RuleResult> {
       status: row.status,
       pageType: row.pageType,
       wordCount: row.wordCount,
+      excluded: skipNoindex && row.robotsNoindex,
     });
   }
 
@@ -310,7 +328,7 @@ export const thinVsSiteNormRule: Rule = {
 
   run(ctx: RuleContext): RuleResult | Promise<RuleResult> {
     if (ctx.siteQuery) {
-      return runViaSiteQuery(ctx.siteQuery);
+      return runViaSiteQuery(ctx.siteQuery, skipsNoindexPages(ctx.site));
     }
 
     const pages = ctx.site?.pages;
@@ -325,6 +343,7 @@ export const thinVsSiteNormRule: Rule = {
         status: page.statusCode,
         pageType: page.parsed?.pageType ?? null,
         wordCount: page.parsed?.content?.wordCount ?? null,
+        excluded: excludesNoindexPage(ctx.site, page.parsed, page.headers),
       });
     }
 

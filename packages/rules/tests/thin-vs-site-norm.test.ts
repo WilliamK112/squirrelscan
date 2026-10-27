@@ -22,6 +22,10 @@ interface PageSpec {
   pageType: string | null;
   wordCount: number | null;
   status?: number;
+  /** Meta robots noindex (legacy parsed meta) / robotsNoindex (streaming row). */
+  noindex?: boolean;
+  /** Same noindex, delivered as an X-Robots-Tag response header. */
+  headerNoindex?: boolean;
 }
 
 function url(i: number): string {
@@ -40,7 +44,7 @@ const baseCtx = {
 };
 
 /** Legacy path: specs become `ctx.site.pages` in crawl (url ascending) order. */
-function legacyCtx(specs: PageSpec[]): RuleContext {
+function legacyCtx(specs: PageSpec[], siteIndexable?: boolean): RuleContext {
   return {
     ...baseCtx,
     site: {
@@ -51,10 +55,13 @@ function legacyCtx(specs: PageSpec[]): RuleContext {
         parsed: {
           pageType: spec.pageType,
           content: { wordCount: spec.wordCount },
+          meta: { robots: spec.noindex ? "noindex,follow" : null },
         } as unknown as ParsedPage,
+        headers: spec.headerNoindex ? { "x-robots-tag": "noindex" } : {},
       })),
       robotsTxt: null,
       sitemaps: null,
+      siteIndexable,
     },
   };
 }
@@ -72,7 +79,7 @@ function featureRow(spec: PageSpec, i: number): PageFeatureRow {
     wordCount: spec.wordCount,
     pageType: spec.pageType,
     schemaTypes: [],
-    robotsNoindex: false,
+    robotsNoindex: !!(spec.noindex || spec.headerNoindex),
     canonical: null,
     visibleAuthor: false,
     visibleDate: false,
@@ -100,7 +107,7 @@ function featureRow(spec: PageSpec, i: number): PageFeatureRow {
  * rest of the SiteQuery surface throws — a stub that silently returned empties
  * could hide the rule reading something it must not.
  */
-function siteQueryCtx(specs: PageSpec[]): RuleContext {
+function siteQueryCtx(specs: PageSpec[], siteIndexable?: boolean): RuleContext {
   const rows = specs.map(featureRow);
   const unused = (): never => {
     throw new Error("thin-vs-site-norm must not use this SiteQuery method");
@@ -122,7 +129,13 @@ function siteQueryCtx(specs: PageSpec[]): RuleContext {
   return {
     ...baseCtx,
     // EMPTY pages — the streaming path must not read them.
-    site: { baseUrl: "https://example.com/", pages: [], robotsTxt: null, sitemaps: null },
+    site: {
+      baseUrl: "https://example.com/",
+      pages: [],
+      robotsTxt: null,
+      sitemaps: null,
+      siteIndexable,
+    },
     siteQuery,
   };
 }
@@ -132,9 +145,9 @@ async function checks(ctx: RuleContext): Promise<CheckResult[]> {
 }
 
 /** Run BOTH paths over one fixture, assert byte-identical output, return it. */
-async function bothPaths(specs: PageSpec[]): Promise<CheckResult> {
-  const legacy = await checks(legacyCtx(specs));
-  const streamed = await checks(siteQueryCtx(specs));
+async function bothPaths(specs: PageSpec[], siteIndexable?: boolean): Promise<CheckResult> {
+  const legacy = await checks(legacyCtx(specs, siteIndexable));
+  const streamed = await checks(siteQueryCtx(specs, siteIndexable));
   expect(streamed).toEqual(legacy);
   expect(JSON.stringify(streamed)).toBe(JSON.stringify(legacy));
   expect(legacy).toHaveLength(1);
@@ -251,20 +264,14 @@ describe("content/thin-vs-site-norm — findings", () => {
   });
 
   test("fails once a fifth of the judged pages are outliers", async () => {
-    const specs = [
-      ...uniform("article", 1800, 10),
-      ...uniform("article", 400, 4),
-    ];
+    const specs = [...uniform("article", 1800, 10), ...uniform("article", 400, 4)];
     const check = await bothPaths(specs);
     expect(check.status).toBe("fail");
     expect(check.value).toBe(4);
   });
 
   test("caps the reported items", async () => {
-    const specs = [
-      ...uniform("article", 1800, 40),
-      ...uniform("article", 400, 12),
-    ];
+    const specs = [...uniform("article", 1800, 40), ...uniform("article", 400, 12)];
     const check = await bothPaths(specs);
     expect(check.status).toBe("fail");
     expect(check.items?.length).toBe(10);
@@ -290,5 +297,37 @@ describe("content/thin-vs-site-norm — empty crawl", () => {
   test("legacy path with no pages skips", async () => {
     const result = await checks(legacyCtx([]));
     expect(result[0]?.status).toBe("skipped");
+  });
+});
+
+describe("content/thin-vs-site-norm — noindex pages (#1029)", () => {
+  const specs = (noindex: boolean): PageSpec[] => [
+    ...uniform("article", 1800, 10),
+    { pageType: "article", wordCount: 400, noindex },
+    { pageType: "article", wordCount: 350, headerNoindex: noindex },
+  ];
+
+  test("leaves noindex pages out of the norm and findings on an indexed site", async () => {
+    const check = await bothPaths(specs(true), true);
+    expect(check.status).toBe("pass");
+    expect(check.details?.judgedPages).toBe(10);
+    expect(check.details?.flaggedPages).toBe(0);
+    expect(check.details?.skippedNoindexPages).toBe(2);
+  });
+
+  test("counts those pages when the site itself is noindex or unknown", async () => {
+    for (const siteIndexable of [false, undefined]) {
+      const check = await bothPaths(specs(true), siteIndexable);
+      expect(check.status).toBe("warn");
+      expect(check.details?.judgedPages).toBe(12);
+      expect(check.details?.flaggedPages).toBe(2);
+      expect(check.details?.skippedNoindexPages).toBe(0);
+    }
+  });
+
+  test("reports zero skipped pages when the short pages are indexable", async () => {
+    const check = await bothPaths(specs(false), true);
+    expect(check.status).toBe("warn");
+    expect(check.details?.skippedNoindexPages).toBe(0);
   });
 });
