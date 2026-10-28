@@ -19,6 +19,7 @@ How it works:
 
 ### Fixed
 
+- **Keyword-stuffing checks skip a declared language they cannot read.** English, German, Spanish, French, Portuguese, Italian and Dutch copy is checked with its function-word list; another declared language is not judged against English words. English price-note terms (`incl`, `VAT`) are ignored only on English pages, so they remain detectable elsewhere. (#1232)
 - `eeat/about-page` and `eeat/contact-page` now recognise an in-page About or Contact section in a real audit. The v0.0.139 change (#1208) only worked where a page's DOM was still available, which the streaming engine, the one the CLI and the cloud run, does not provide to site rules, so a one-page site still read "No About page found". The section is now collected from each page while its DOM is live. An engine-level test runs the one-page fixture through the streaming engine (#1236).
 
 ## v0.0.139 (2026-10-28)
@@ -79,7 +80,6 @@ The bundled page classifier and the findings built on it: link findings say wher
 - **The install channel now reaches install registration.** `squirrel self install` skips startup extras, so `SQUIRREL_INSTALL_SOURCE` was gone by the first command that registers the install and every install reported `binary`. `self install` now persists the validated value (`^[a-z0-9-]{1,32}$`, anything else is dropped) and registration sends it. install.sh stamps `install-sh` when no source is set.
 - **Installer failure reports name the host when curl cannot connect.** A curl failure under `set -e` (exit 6, 7, 28, 35, 52 or 56) reported only its code, so 82 identical reports could not be told apart. The anonymous report now carries `curl exit N reaching <host>`: the host only, never a path, query or credentials.
 - **Keyword-stuffing checks measure substantial main copy instead of site chrome.** The largest main landmark is used when it has at least 100 words; otherwise the body is measured without site-wide header, navigation, footer and sidebar boilerplate, while article-local landmarks stay in the copy. Unicode words such as `gemäß` stay whole, unsegmented Han, Kana and Hangul runs are not scored, and repeated German and English price-note terms are ignored. (#1182)
-- **Keyword-stuffing checks skip a declared language they cannot read.** English, German, Spanish, French, Portuguese, Italian and Dutch copy is checked with its function-word list; another declared language is not judged against English words. English price-note terms (`incl`, `VAT`) are ignored only on English pages, so they remain detectable elsewhere. (#1232)
 - **The editor summary digest of a capped published report counts every issue.** A rule with more than 25 issue classes lost the rest from its occurrence count, so a summary built from the stored report could under-count and re-rank issues against the one built from the full report. The digest now takes the true counts from the report's check tallies.
 
 ### Security

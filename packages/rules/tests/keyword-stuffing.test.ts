@@ -182,6 +182,12 @@ describe("content/keyword-stuffing language stop words (#1042)", () => {
     expect(checks[0].status).toBe("pass");
   });
 
+  test("a malformed English language tag keeps the English price-note exclusions", () => {
+    const html = `<html lang="en_US"><body><p>${"VAT ".repeat(30)}${filler(120)}</p></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("pass");
+  });
+
   test("a declared language without a function-word list is skipped", () => {
     const html = `<html lang="xx"><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
