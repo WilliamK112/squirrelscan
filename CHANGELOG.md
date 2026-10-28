@@ -19,6 +19,7 @@ How it works:
 
 ### Fixed
 
+- **Leaked-secret checks no longer flag credential key-name constants as values.** A bundle constant such as `DROPBOX_ACCESS_TOKEN: "dropbox-access-token"` is recognised as a storage or configuration identifier, while random credential-shaped assignments still report. (#1228)
 - `eeat/about-page` and `eeat/contact-page` now recognise an in-page About or Contact section in a real audit. The v0.0.139 change (#1208) only worked where a page's DOM was still available, which the streaming engine, the one the CLI and the cloud run, does not provide to site rules, so a one-page site still read "No About page found". The section is now collected from each page while its DOM is live. An engine-level test runs the one-page fixture through the streaming engine (#1236).
 
 ## v0.0.139 (2026-10-28)
