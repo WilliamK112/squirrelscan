@@ -176,10 +176,40 @@ describe("content/keyword-stuffing language stop words (#1042)", () => {
     expect(checks[0].items?.some((item) => item.id === "bademode")).toBe(true);
   });
 
-  test("an unknown page language keeps the English exclusions", () => {
-    const html = `<html lang="xx"><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
+  test("a missing page language keeps the English exclusions", () => {
+    const html = `<html><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
     expect(checks[0].status).toBe("pass");
+  });
+
+  test("a declared language without a function-word list is skipped", () => {
+    const html = `<html lang="xx"><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0]).toMatchObject({
+      status: "skipped",
+      message: 'No function-word list for language "xx"',
+    });
+  });
+
+  test("a natural Russian paragraph is not judged without a Russian function-word list", () => {
+    const paragraph =
+      "Городская библиотека открывает новые залы для читателей, которые хотят спокойно работать, изучать архивы и обсуждать книги с друзьями. " +
+      "По утрам сотрудники готовят столы для студентов, которым нужны справочники, редкие журналы, карты и удобные места рядом с окнами. " +
+      "После обеда приходит семейная группа для занятий, где дети слушают рассказы, рисуют героев и выбирают произведения на следующую неделю. " +
+      "В отдельной комнате проходят встречи для исследователей, которые делятся результатами, задают вопросы и помогают коллегам находить надежные источники. " +
+      "Небольшая студия создана для музыкантов, желающих записывать подкасты, читать стихи и сохранять устные воспоминания жителей старого района. " +
+      "Во дворе устроили сад для соседей, где волонтеры выращивают травы, проводят лекции о природе и отдыхают после долгой прогулки. " +
+      "Электронный каталог полезен для посетителей, которые заранее проверяют наличие изданий, бронируют материалы и продлевают срок возврата через сайт. " +
+      "Зимой сотрудники организуют курсы для пожилых людей, объясняя безопасную работу с почтой, видеосвязью, государственными услугами и цифровыми фотографиями. " +
+      "Весной библиотека приглашает переводчиков для открытых бесед, на которых звучат современные тексты, местные истории и голоса разных поколений. " +
+      "Каждый проект задуман для сообщества, поэтому программа меняется после опросов, личных разговоров и внимательного анализа предложений постоянных гостей.";
+    expect(keywordTokens(paragraph).length).toBeGreaterThanOrEqual(150);
+    const html = `<html lang="ru"><body><p>${paragraph}</p></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0]).toMatchObject({
+      status: "skipped",
+      message: 'No function-word list for language "ru"',
+    });
   });
 });
 
@@ -279,6 +309,13 @@ describe("content/keyword-stuffing main copy and Unicode words (#1182)", () => {
     expect(checks[0].status).toBe("pass");
   });
 
+  test.each(["incl", "VAT"])("German copy does not ignore the English price term %p", (word) => {
+    const html = `<html lang="de"><body><main><p>${`${word} `.repeat(20)}${filler(120)}</p></main></body></html>`;
+    const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === word.toLowerCase())).toBe(true);
+  });
+
   test("a token longer than the item limit is ignored instead of split", () => {
     const longToken = "ä".repeat(80);
     expect(keywordTokens(`${longToken} normal`)).toEqual(["normal"]);
@@ -293,7 +330,7 @@ describe("content/keyword-stuffing main copy and Unicode words (#1182)", () => {
     expect(keywordTokens("検索検索 검색검색 カタカナカタカナ normal")).toEqual(["normal"]);
     const html = `<html lang="ja"><body><main><p>${"検索検索。".repeat(30)}${filler(120)}</p></main></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
-    expect(checks[0].status).toBe("pass");
+    expect(checks[0].status).toBe("skipped");
   });
 });
 

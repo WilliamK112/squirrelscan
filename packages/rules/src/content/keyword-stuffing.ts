@@ -33,10 +33,12 @@ const COMMON_WORDS = wordSet(
   // Function words / generic verbs (#695) that read as high density on
   // ordinary pages, never as a real SEO target.
   "your our his her its who whom whose get here very such same each any all most much many even still yet",
-  // Price-note boilerplate repeated beside every product on English shops
-  // (#1182), not copy written to target a search term.
-  "incl vat",
 );
+
+// Price-note boilerplate repeated beside every product on English shops
+// (#1182), not copy written to target a search term. Unlike COMMON_WORDS,
+// these terms are meaningful copy in other languages (#1232).
+const ENGLISH_PRICE_NOTE_WORDS = wordSet("incl vat");
 
 const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
   [
@@ -313,6 +315,18 @@ export const keywordStuffingRule: Rule = {
       return { checks };
     }
 
+    const pageLanguage = primaryLangSubtag(doc.documentElement?.getAttribute("lang"));
+    const pageStopWords = LANGUAGE_STOP_WORDS.get(pageLanguage);
+    if (pageLanguage !== "" && pageLanguage !== "en" && !pageStopWords) {
+      checks.push({
+        name: "keyword-stuffing",
+        status: "skipped",
+        message: `No function-word list for language "${pageLanguage}"`,
+      });
+      return { checks };
+    }
+    const usesEnglishPriceNotes = pageLanguage === "" || pageLanguage === "en";
+
     // Prefer substantial main copy. Otherwise retain body copy but drop only
     // site-wide chrome, not headers and footers inside articles or sections.
     // Both paths are non-mutating because every rule shares this document.
@@ -335,10 +349,6 @@ export const keywordStuffingRule: Rule = {
 
     // Find words with high density, excluding English common words and the
     // grammatical filler for the page's declared language (#1042).
-    const pageStopWords = LANGUAGE_STOP_WORDS.get(
-      primaryLangSubtag(doc.documentElement?.getAttribute("lang")),
-    );
-
     // Repeated generic nav/CTA labels ("Learn more" x11 cards) are a UI
     // component, not organic content — don't count their words toward
     // density (#695). Deliberately an ALLOWLIST of known boilerplate phrases
@@ -410,7 +420,13 @@ export const keywordStuffingRule: Rule = {
 
     if (organicTotal > 0) {
       for (const [word, rawCount] of wordCounts) {
-        if (COMMON_WORDS.has(word) || pageStopWords?.has(word)) continue;
+        if (
+          COMMON_WORDS.has(word) ||
+          pageStopWords?.has(word) ||
+          (usesEnglishPriceNotes && ENGLISH_PRICE_NOTE_WORDS.has(word))
+        ) {
+          continue;
+        }
         if (whitelist.has(word)) continue;
 
         const count = rawCount - (ctaWordDeductions.get(word) ?? 0);
