@@ -5,6 +5,8 @@
 # Environment variables:
 #   SQUIRREL_VERSION   - Pin to specific version (e.g., v0.0.15)
 #   SQUIRREL_CHANNEL   - Release channel: stable or beta (default: stable)
+#   SQUIRREL_NO_MODIFY_PATH - Never edit the user PATH; print instructions
+#                        instead. Any value but empty, 0 or false enables it.
 #   SQUIRREL_FORCE_MIRROR - Skip github.com and download from
 #                        install.squirrelscan.com (for networks that block
 #                        GitHub). Any value but empty, 0 or false enables it.
@@ -54,6 +56,7 @@ $DownloadEndpoint = if ($env:SQUIRREL_DOWNLOAD_ENDPOINT) { $env:SQUIRREL_DOWNLOA
 $ErrorLineMax = 200
 $ErrorOutputMax = 1000
 $script:CurrentStep = "init"
+$script:PathSetup = ""
 $script:LastCapturedExitCode = 0
 # Where `squirrel self install` puts the binary on Windows. Hoisted to script
 # scope because the download-failure guidance names it too, not only the PATH
@@ -587,17 +590,116 @@ function Install-Squirrel {
     }
 }
 
+# Same flag semantics as the shell installer: empty, 0 and false are off.
+function Test-NoModifyPath {
+    $v = "$env:SQUIRREL_NO_MODIFY_PATH".Trim().ToLowerInvariant()
+    return ($v -ne "" -and $v -ne "0" -and $v -ne "false")
+}
+
+function Test-CiEnvironment {
+    $v = "$env:CI".Trim().ToLowerInvariant()
+    return ($v -ne "" -and $v -ne "0" -and $v -ne "false")
+}
+
+# True when $Dir is one of the ';'-separated entries of $PathValue.
+function Test-PathHasDir {
+    param([string]$PathValue, [string]$Dir)
+    foreach ($entry in ("$PathValue" -split ";")) {
+        # A User Path entry can hold %VARS% (REG_EXPAND_SZ); compare it expanded.
+        $expanded = [Environment]::ExpandEnvironmentVariables($entry)
+        if ($expanded.TrimEnd("\") -ieq $Dir.TrimEnd("\")) { return $true }
+    }
+    return $false
+}
+
+# The User Path exactly as stored, %VARS% unexpanded ("" when unset).
+function Get-RawUserPath {
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment")
+        if (-not $key) { return "" }
+        try {
+            return [string]$key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        } finally {
+            $key.Close()
+        }
+    } catch {
+        # No registry (non-Windows PowerShell): the expanded value is the best there is.
+        return [string][Environment]::GetEnvironmentVariable("Path", "User")
+    }
+}
+
+# Put $BinDir on the User-scope Path (never Machine) and on this session's
+# $env:Path. Returns the outcome stamped for `squirrel self install`:
+# on_path | added | opted_out | ci | failed
+function Set-UserPath {
+    param([string]$BinDir)
+
+    # The raw, unexpanded value: expanding it and writing it back would
+    # flatten any %VARS% entries the user keeps in their Path.
+    $userPath = Get-RawUserPath
+    if (Test-PathHasDir $userPath $BinDir) {
+        # Already persisted; make sure this session sees it too.
+        if (-not (Test-PathHasDir $env:Path $BinDir)) {
+            $env:Path = ("$env:Path".TrimEnd(";") + ";" + $BinDir)
+        }
+        return "on_path"
+    }
+    # On this session's Path only: nothing to persist, and none of our business.
+    if (Test-PathHasDir $env:Path $BinDir) { return "on_path" }
+    if (Test-NoModifyPath) { return "opted_out" }
+    if (Test-CiEnvironment) {
+        if ($env:GITHUB_PATH) {
+            try { Add-Content -Path $env:GITHUB_PATH -Value $BinDir -ErrorAction Stop } catch { return "failed" }
+        }
+        return "ci"
+    }
+    # A symbolic %LOCALAPPDATA% fallback (no such variable) is not a real path.
+    if ($BinDir -like "*%*") { return "failed" }
+
+    try {
+        $newPath = if ($userPath) { $userPath.TrimEnd(";") + ";" + $BinDir } else { $BinDir }
+        if ($newPath -like "*%*") {
+            # SetEnvironmentVariable would rewrite the value as REG_SZ and stop
+            # %VARS% entries expanding. Write REG_EXPAND_SZ, then set and clear a
+            # throwaway variable so Windows broadcasts WM_SETTINGCHANGE and new
+            # terminals see the Path.
+            # A null $key throws below and the catch reports "failed".
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+            try {
+                $key.SetValue("Path", $newPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            } finally {
+                $key.Close()
+            }
+            [Environment]::SetEnvironmentVariable("SQUIRREL_PATH_NOTIFY", "1", "User")
+            [Environment]::SetEnvironmentVariable("SQUIRREL_PATH_NOTIFY", $null, "User")
+        } else {
+            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+        }
+        $env:Path = ("$env:Path".TrimEnd(";") + ";" + $BinDir)
+        return "added"
+    } catch {
+        return "failed"
+    }
+}
+
 function Show-Epilogue {
     # Get-started epilogue: lead with the first audit, then `squirrel setup`
     # (sign-in, agent skills, defaults), which also ends by offering an audit.
-    param([string]$Version)
+    param([string]$Version, [string]$BinDir = "", [string]$PathSetup = "")
 
     Write-Host ""
     Write-Host "squirrel $Version installed" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Run your first audit (crawls the site, scores it, lists exact fixes):"
-    Write-Host ""
-    Write-Host "  squirrel audit https://your-site.com"
+    if ($PathSetup -in @("opted_out", "ci", "failed") -and $BinDir) {
+        # This session cannot find squirrel: name a command that works now.
+        Write-Host "squirrel is not on your PATH yet. Run your first audit right now:"
+        Write-Host ""
+        Write-Host "  & '$($BinDir.Replace("'", "''"))\squirrel.exe' audit https://your-site.com"
+    } else {
+        Write-Host "Run your first audit (crawls the site, scores it, lists exact fixes):"
+        Write-Host ""
+        Write-Host "  squirrel audit https://your-site.com"
+    }
     Write-Host ""
     Write-Host "Then set up sign-in, agent skills and defaults:  squirrel setup"
     Write-Host "Docs: https://docs.squirrelscan.com"
@@ -629,19 +731,23 @@ function Main {
         Write-Log "Latest version: $version (channel: $channel)"
     }
 
+    # Put the bin dir on PATH before self install, which hands the outcome to
+    # the CLI's one-time install registration (path_setup).
+    $binDir = $script:InstallBinDir
+    $script:PathSetup = Set-UserPath -BinDir $binDir
+    $env:SQUIRREL_PATH_SETUP = $script:PathSetup
+
     # Get manifest and install
     $manifest = Get-Manifest -Version $version
     Install-Squirrel -Version $version -Manifest $manifest
 
-    Show-Epilogue -Version $version
+    if ($script:PathSetup -eq "added") {
+        Write-Info "Added $binDir to your user PATH. New terminals pick it up."
+    }
 
-    # Check PATH
-    $binDir = $script:InstallBinDir
-    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $currentPath = $env:Path
+    Show-Epilogue -Version $version -BinDir $binDir -PathSetup $script:PathSetup
 
-    if (($currentPath -notlike "*$binDir*") -and ($userPath -notlike "*$binDir*")) {
+    if ($script:PathSetup -in @("opted_out", "failed", "ci")) {
         Write-Host ""
         Write-Warn "$binDir is not in your PATH"
         Write-Host ""
