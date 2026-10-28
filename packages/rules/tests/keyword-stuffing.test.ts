@@ -176,25 +176,36 @@ describe("content/keyword-stuffing language stop words (#1042)", () => {
     expect(checks[0].items?.some((item) => item.id === "bademode")).toBe(true);
   });
 
-  test("a missing page language keeps the English exclusions", () => {
-    const html = `<html><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
+  test.each(["", "x-default", "und", "mul", "zxx", "xx", "qaa"])(
+    "%p keeps the English common-word exclusions when it has no usable function-word list",
+    (lang) => {
+      const html = `<html lang="${lang}"><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
+      const { checks } = keywordStuffingRule.run(ctx(html));
+      expect(checks[0].status).toBe("pass");
+    },
+  );
+
+  test.each(["en-GB", "EN", "en_US"])("%p keeps the English price-note exclusions", (lang) => {
+    const html = `<html lang="${lang}"><body><p>${"VAT ".repeat(30)}${filler(120)}</p></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
     expect(checks[0].status).toBe("pass");
   });
 
-  test("a malformed English language tag keeps the English price-note exclusions", () => {
-    const html = `<html lang="en_US"><body><p>${"VAT ".repeat(30)}${filler(120)}</p></body></html>`;
-    const { checks } = keywordStuffingRule.run(ctx(html));
-    expect(checks[0].status).toBe("pass");
-  });
+  test.each(["ja", "pl", "tr", "sv", "cs", "id", "vi"])(
+    "%p still detects Latin-script stuffing without its own function-word list",
+    (lang) => {
+      const html = `<html lang="${lang}"><body><p>${"widget ".repeat(30)}${filler(120)}</p></body></html>`;
+      const { checks } = keywordStuffingRule.run(ctx(html));
+      expect(checks[0].status).toBe("warn");
+      expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
+    },
+  );
 
-  test("a declared language without a function-word list is skipped", () => {
-    const html = `<html lang="xx"><body><p>${"the ".repeat(30)}${filler(120)}</p></body></html>`;
+  test("an unsupported lang alone cannot turn off Latin-script stuffing detection", () => {
+    const html = `<html lang="ru"><body><p>${"widget ".repeat(30)}${filler(120)}</p></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
-    expect(checks[0]).toMatchObject({
-      status: "skipped",
-      message: 'No function-word list for language "xx"',
-    });
+    expect(checks[0].status).toBe("warn");
+    expect(checks[0].items?.some((item) => item.id === "widget")).toBe(true);
   });
 
   test("a natural Russian paragraph is not judged without a Russian function-word list", () => {
@@ -210,11 +221,12 @@ describe("content/keyword-stuffing language stop words (#1042)", () => {
       "Весной библиотека приглашает переводчиков для открытых бесед, на которых звучат современные тексты, местные истории и голоса разных поколений. " +
       "Каждый проект задуман для сообщества, поэтому программа меняется после опросов, личных разговоров и внимательного анализа предложений постоянных гостей.";
     expect(keywordTokens(paragraph).length).toBeGreaterThanOrEqual(150);
-    const html = `<html lang="ru"><body><p>${paragraph}</p></body></html>`;
+    const html = `<html lang="ru-RU"><body><p>${paragraph}</p></body></html>`;
     const { checks } = keywordStuffingRule.run(ctx(html));
+    expect(checks[0].status).not.toBe("warn");
     expect(checks[0]).toMatchObject({
       status: "skipped",
-      message: 'No function-word list for language "ru"',
+      message: "Most content uses a script without a function-word list",
     });
   });
 });
@@ -322,6 +334,16 @@ describe("content/keyword-stuffing main copy and Unicode words (#1182)", () => {
     expect(checks[0].items?.some((item) => item.id === word.toLowerCase())).toBe(true);
   });
 
+  test.each(["incl", "VAT"])(
+    "German body-fallback copy does not ignore the English price term %p",
+    (word) => {
+      const html = `<html lang="de"><body><p>${`${word} `.repeat(20)}${filler(120)}</p></body></html>`;
+      const { checks } = keywordStuffingRule.run(ctx(html));
+      expect(checks[0].status).toBe("warn");
+      expect(checks[0].items?.some((item) => item.id === word.toLowerCase())).toBe(true);
+    },
+  );
+
   test("a token longer than the item limit is ignored instead of split", () => {
     const longToken = "ä".repeat(80);
     expect(keywordTokens(`${longToken} normal`)).toEqual(["normal"]);
@@ -334,9 +356,6 @@ describe("content/keyword-stuffing main copy and Unicode words (#1182)", () => {
 
   test("Han, Kana and Hangul runs are not treated as whole words", () => {
     expect(keywordTokens("検索検索 검색검색 カタカナカタカナ normal")).toEqual(["normal"]);
-    const html = `<html lang="ja"><body><main><p>${"検索検索。".repeat(30)}${filler(120)}</p></main></body></html>`;
-    const { checks } = keywordStuffingRule.run(ctx(html));
-    expect(checks[0].status).toBe("skipped");
   });
 });
 

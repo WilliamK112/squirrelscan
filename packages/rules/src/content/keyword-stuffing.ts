@@ -89,6 +89,7 @@ const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
 const MAX_WORD_CODE_POINTS = 64;
 const MAX_MAIN_LANDMARK_CANDIDATES = 8;
 const LETTER = /^\p{L}$/u;
+const LATIN_LETTER = /^\p{Script=Latin}$/u;
 const MARK = /^\p{M}$/u;
 const UNSEGMENTED_EAST_ASIAN =
   /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -140,6 +141,20 @@ export function keywordTokens(text: string): string[] {
   }
   finishWord();
   return words;
+}
+
+/** Whether most measured letters use scripts for which the rule has no word list. */
+function hasUnsupportedScriptMajority(words: readonly string[]): boolean {
+  let latinLetters = 0;
+  let unsupportedLetters = 0;
+  for (const word of words) {
+    for (const char of word) {
+      if (!LETTER.test(char)) continue;
+      if (LATIN_LETTER.test(char)) latinLetters += 1;
+      else unsupportedLetters += 1;
+    }
+  }
+  return unsupportedLetters > latinLetters;
 }
 
 const CHROME_TAGS = new Set(["header", "nav", "footer", "aside"]);
@@ -317,20 +332,24 @@ export const keywordStuffingRule: Rule = {
 
     const pageLanguage = primaryLangSubtag(doc.documentElement?.getAttribute("lang"));
     const pageStopWords = LANGUAGE_STOP_WORDS.get(pageLanguage);
-    if (pageLanguage !== "" && pageLanguage !== "en" && !pageStopWords) {
-      checks.push({
-        name: "keyword-stuffing",
-        status: "skipped",
-        message: `No function-word list for language "${pageLanguage}"`,
-      });
-      return { checks };
-    }
     const usesEnglishPriceNotes = pageLanguage === "" || pageLanguage === "en";
 
     // Prefer substantial main copy. Otherwise retain body copy but drop only
     // site-wide chrome, not headers and footers inside articles or sections.
     // Both paths are non-mutating because every rule shares this document.
     const { root: contentRoot, words, isInExcludedChrome } = selectMainContent(doc, body);
+
+    // A lang attribute is page-controlled and must not turn off a scored rule.
+    // Skip only when the measured copy itself is predominantly written in a
+    // script for which the rule has no function-word list (#1232).
+    if (hasUnsupportedScriptMajority(words)) {
+      checks.push({
+        name: "keyword-stuffing",
+        status: "skipped",
+        message: "Most content uses a script without a function-word list",
+      });
+      return { checks };
+    }
 
     if (words.length < 100) {
       checks.push({
