@@ -1,7 +1,10 @@
 // Tests for reachability utilities
 
+import { EGRESS_OFF_SITE_REFUSAL } from "@squirrelscan/utils/public-egress";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Effect } from "effect";
 
+import { requestOnceScoped, RequestError } from "../../src/tools/request";
 import { checkReachability } from "../../src/utils/reachability";
 
 describe("checkReachability", () => {
@@ -141,5 +144,32 @@ describe("checkReachability and an offline audit (#819)", () => {
     expect(result.reachable).toBe(true);
     expect(seen.length).toBeGreaterThan(0);
     expect(seen[0]?.host).toBe(`localhost:${other.port}`);
+  });
+
+  test("non-localhost: an off-site redirect refusal still counts as reachable", async () => {
+    let requestCalls = 0;
+    const requestStub: typeof requestOnceScoped = <T>() => {
+      requestCalls++;
+      return Effect.fail(
+        new RequestError({
+          url: "https://apps.example.com/tool/",
+          message: EGRESS_OFF_SITE_REFUSAL,
+        })
+      ) as Effect.Effect<T, RequestError, never>;
+    };
+
+    for (const url of [
+      "https://apps.example.com/tool/",
+      "https://go.example.com/x",
+    ]) {
+      const result = await checkReachability(
+        url,
+        { ownSiteOnly: true },
+        requestStub
+      );
+      expect(result).toEqual({ reachable: true, statusCode: 302 });
+    }
+
+    expect(requestCalls).toBe(2);
   });
 });
