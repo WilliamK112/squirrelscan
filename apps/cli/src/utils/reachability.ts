@@ -221,10 +221,11 @@ function reachabilitySend(
  */
 export async function checkReachability(
   url: string,
-  scope?: ReachabilityScope
+  scope?: ReachabilityScope,
+  requestScoped: typeof requestOnceScoped = requestOnceScoped
 ): Promise<ReachabilityResult> {
   const deadline = Date.now() + REACHABILITY_TOTAL_BUDGET_MS;
-  let result = await attemptReachability(url, scope);
+  let result = await attemptReachability(url, scope, requestScoped);
 
   for (let attempt = 2; attempt <= REACHABILITY_MAX_ATTEMPTS; attempt++) {
     if (result.reachable || !isTransientReachabilityError(result.error)) break;
@@ -237,7 +238,7 @@ export async function checkReachability(
       result.error ?? ""
     );
     await sleep(delay);
-    result = await attemptReachability(url, scope);
+    result = await attemptReachability(url, scope, requestScoped);
   }
 
   return result;
@@ -245,7 +246,8 @@ export async function checkReachability(
 
 async function attemptReachability(
   url: string,
-  scope?: ReachabilityScope
+  scope: ReachabilityScope | undefined,
+  requestScoped: typeof requestOnceScoped
 ): Promise<ReachabilityResult> {
   // Fast path for localhost/loopback using native fetch (no WAF detection needed)
   let isLocalhost = false;
@@ -314,8 +316,8 @@ async function attemptReachability(
 
     // The deadline stays armed through the body sample, so a server that
     // sends headers and then stalls cannot park the probe (#192).
-    const response = await Effect.runPromise(
-      requestOnceScoped(
+    const outcome = await Effect.runPromise(
+      requestScoped(
         url,
         { method: "GET" },
         async (res) => {
@@ -357,20 +359,16 @@ async function attemptReachability(
               url,
               message: "Connection timed out",
             }),
-        })
+        }),
+        Effect.either
       )
     );
-    const wafResult = response.wafResult;
 
-    return {
-      reachable: true,
-      statusCode: response.status,
-      wafDetected: wafResult.detected,
-      wafProvider: wafResult.provider ?? undefined,
-    };
-  } catch (error) {
-    // Handle RequestError from request utility
-    if (error instanceof RequestError) {
+    // Keep typed request failures inside the Effect value. `runPromise` wraps
+    // failures in a FiberFailure, which would hide RequestError from the
+    // handling below (notably the deliberate offline off-site redirect case).
+    if (outcome._tag === "Left") {
+      const error = outcome.left;
       if (error.message === EGRESS_OFF_SITE_REFUSAL) {
         return { reachable: true, statusCode: OFF_SITE_REDIRECT_STATUS };
       }
@@ -383,6 +381,16 @@ async function attemptReachability(
       };
     }
 
+    const response = outcome.right;
+    const wafResult = response.wafResult;
+
+    return {
+      reachable: true,
+      statusCode: response.status,
+      wafDetected: wafResult.detected,
+      wafProvider: wafResult.provider ?? undefined,
+    };
+  } catch (error) {
     const err = error as Error;
     const message = (err.message ?? "").toLowerCase();
 
