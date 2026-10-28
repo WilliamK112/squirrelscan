@@ -20,6 +20,7 @@ How it works:
 ### Fixed
 
 - **Keyword-stuffing checks use the measured copy's script instead of trusting `lang`.** English, German, Spanish, French, Portuguese, Italian and Dutch copy is checked with its function-word list. Copy written mainly in another script is not judged against English words, while an unsupported `lang` alone cannot turn the check off. English price-note terms (`incl`, `VAT`) are ignored only on English pages, so they remain detectable elsewhere. (#1232)
+- `squirrel audit --offline` now treats a non-localhost start URL that redirects off-site as reachable, so the crawl can record the redirect instead of stopping at the preflight probe with `refused: host outside the allowed set`. This also covers link-shortener and sibling-host redirects. (#1224)
 - `eeat/about-page` and `eeat/contact-page` now recognise an in-page About or Contact section in a real audit. The v0.0.139 change (#1208) only worked where a page's DOM was still available, which the streaming engine, the one the CLI and the cloud run, does not provide to site rules, so a one-page site still read "No About page found". The section is now collected from each page while its DOM is live. An engine-level test runs the one-page fixture through the streaming engine (#1236).
 
 ## v0.0.139 (2026-10-28)
