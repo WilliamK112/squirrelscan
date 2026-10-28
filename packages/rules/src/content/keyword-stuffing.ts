@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { primaryLangSubtag } from "../shared/generic-link-phrases";
 import type { Rule, RuleContext, RuleResult, CheckResult, ParsedPage } from "../types";
-import { getTextExcludingScripts } from "./text-content";
+import { getRenderedProseText, getRenderedProseTextWhere } from "./text-content";
 
 export const optionsSchema = z.object({
   density_threshold: z.number().default(3).describe("Keyword density percentage threshold"),
@@ -33,6 +33,9 @@ const COMMON_WORDS = wordSet(
   // Function words / generic verbs (#695) that read as high density on
   // ordinary pages, never as a real SEO target.
   "your our his her its who whom whose get here very such same each any all most much many even still yet",
+  // Price-note boilerplate repeated beside every product on English shops
+  // (#1182), not copy written to target a search term.
+  "incl vat",
 );
 
 const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
@@ -41,7 +44,7 @@ const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
     wordSet(
       "aber alle allem allen aller alles als also ander andere anderem anderen anderer anderes auch auf aus bei bin bis bist damit dann das dass dein deine dem den denn der des die dies diese",
       "ein eine einem einen einer eines etwas hat haben hier ich ihr ihre ist jede kein keine man mehr mein meine mit nach nicht noch nun nur oder sein seine sind solche und uns unser",
-      "vom von war waren was wenn wer wie wir wird zum zur",
+      "vom von war waren was wenn wer wie wir wird zum zur inkl mwst zzgl versandkosten",
     ),
   ],
   [
@@ -80,6 +83,155 @@ const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
     ),
   ],
 ]);
+
+const MAX_WORD_CODE_POINTS = 64;
+const MAX_MAIN_LANDMARK_CANDIDATES = 8;
+const LETTER = /^\p{L}$/u;
+const MARK = /^\p{M}$/u;
+const UNSEGMENTED_EAST_ASIAN =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+/**
+ * Lowercase Unicode words without fragmenting umlauts, ß or decomposed letters.
+ * Normalize one bounded token at a time: compatibility normalization can
+ * expand one site-controlled character many times, so normalizing the whole
+ * page first would let a compact input multiply the work. Han, Kana and Hangul
+ * runs are skipped because punctuation boundaries are not word boundaries in
+ * those scripts and this rule has no language segmenter (#1182).
+ */
+export function keywordTokens(text: string): string[] {
+  const words: string[] = [];
+  let rawWord = "";
+  let codePoints = 0;
+  let overflow = false;
+
+  const finishWord = () => {
+    if (!overflow && codePoints >= 3) {
+      const normalized = rawWord.normalize("NFKC").toLowerCase();
+      let normalizedLength = 0;
+      let valid = !UNSEGMENTED_EAST_ASIAN.test(normalized);
+      for (const char of normalized) {
+        normalizedLength += 1;
+        if (
+          normalizedLength > MAX_WORD_CODE_POINTS ||
+          (!LETTER.test(char) && !(normalizedLength > 1 && MARK.test(char)))
+        ) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid && normalizedLength >= 3) words.push(normalized);
+    }
+    rawWord = "";
+    codePoints = 0;
+    overflow = false;
+  };
+
+  for (const char of text) {
+    if (LETTER.test(char) || (codePoints > 0 && MARK.test(char))) {
+      codePoints += 1;
+      if (codePoints <= MAX_WORD_CODE_POINTS) rawWord += char;
+      else overflow = true;
+    } else {
+      finishWord();
+    }
+  }
+  finishWord();
+  return words;
+}
+
+const CHROME_TAGS = new Set(["header", "nav", "footer", "aside"]);
+const CHROME_ROLES = new Set(["banner", "navigation", "contentinfo", "complementary"]);
+const CONTENT_REGION_TAGS = new Set(["article", "section"]);
+
+function isPageChrome(el: Element): boolean {
+  const tag = el.tagName?.toLowerCase();
+  if (tag && CHROME_TAGS.has(tag)) return true;
+  const role = el.getAttribute?.("role")?.toLowerCase();
+  return role ? CHROME_ROLES.has(role) : false;
+}
+
+function isContentRegion(el: Element): boolean {
+  const tag = el.tagName?.toLowerCase();
+  return tag ? CONTENT_REGION_TAGS.has(tag) : false;
+}
+
+/** Site chrome excludes an article's own header, footer, navigation and aside. */
+function isSiteChrome(el: Element, root: Element): boolean {
+  if (!isPageChrome(el)) return false;
+  let current = el.parentElement;
+  while (current && current !== root) {
+    if (isContentRegion(current)) return false;
+    current = current.parentElement;
+  }
+  return true;
+}
+
+function createSiteChromeAncestorTest(root: Element): (element: Element) => boolean {
+  const known = new WeakMap<Element, boolean>();
+  return (element) => {
+    const passed: Element[] = [];
+    let current: Element | null = element;
+    let answer = false;
+    while (current && current !== root) {
+      const cached = known.get(current);
+      if (cached !== undefined) {
+        answer = cached;
+        break;
+      }
+      passed.push(current);
+      if (isSiteChrome(current, root)) {
+        answer = true;
+        break;
+      }
+      current = current.parentElement;
+    }
+    for (const el of passed) known.set(el, answer);
+    return answer;
+  };
+}
+
+interface ContentSelection {
+  readonly root: Element;
+  readonly words: string[];
+  readonly isInExcludedChrome: ((element: Element) => boolean) | null;
+}
+
+function selectMainContent(
+  doc: NonNullable<ParsedPage["document"]>,
+  body: Element,
+): ContentSelection {
+  const isInSiteChrome = createSiteChromeAncestorTest(body);
+  let largest: { readonly root: Element; readonly words: string[] } | undefined;
+  let measuredMainLandmarks = 0;
+
+  // Invalid pages sometimes carry several main landmarks. Prefer the one with
+  // the most rendered copy among a bounded number of candidates, and fall back
+  // to the body when none reaches the rule's 100-word measurement floor. The
+  // bound keeps nested hostile landmarks from rescanning the same subtree.
+  for (const root of doc.querySelectorAll('main, [role="main"]')) {
+    if (isInSiteChrome(root)) continue;
+    if (measuredMainLandmarks >= MAX_MAIN_LANDMARK_CANDIDATES) break;
+    measuredMainLandmarks += 1;
+    const words = keywordTokens(getRenderedProseText(root));
+    if (!largest || words.length > largest.words.length) largest = { root, words };
+  }
+  if (largest && largest.words.length >= 100) {
+    return { ...largest, isInExcludedChrome: null };
+  }
+
+  // One substantial article is the page's primary copy. A listing with several
+  // articles, or a small article beside the real copy, keeps the body fallback.
+  const articles = doc.querySelectorAll("article");
+  if (articles.length === 1 && !isInSiteChrome(articles[0])) {
+    const root = articles[0];
+    const words = keywordTokens(getRenderedProseText(root));
+    if (words.length >= 100) return { root, words, isInExcludedChrome: null };
+  }
+
+  const words = keywordTokens(getRenderedProseTextWhere(body, isInSiteChrome));
+  return { root: body, words, isInExcludedChrome: isInSiteChrome };
+}
 
 /**
  * The site's own brand / product name as lowercase word tokens, from the page's
@@ -161,10 +313,10 @@ export const keywordStuffingRule: Rule = {
       return { checks };
     }
 
-    // Body text with script/style/noscript excluded (non-mutating — the parsed
-    // document is shared across all rules for this page).
-    const text = getTextExcludingScripts(body);
-    const words = text.toLowerCase().match(/[a-z]{3,}/g) || [];
+    // Prefer substantial main copy. Otherwise retain body copy but drop only
+    // site-wide chrome, not headers and footers inside articles or sections.
+    // Both paths are non-mutating because every rule shares this document.
+    const { root: contentRoot, words, isInExcludedChrome } = selectMainContent(doc, body);
 
     if (words.length < 100) {
       checks.push({
@@ -228,7 +380,8 @@ export const keywordStuffingRule: Rule = {
       "back to top",
     ]);
     const ctaLabelCounts = new Map<string, number>();
-    for (const el of doc.querySelectorAll("a, button")) {
+    for (const el of contentRoot.querySelectorAll("a, button")) {
+      if (isInExcludedChrome?.(el)) continue;
       // Nested <a><button>Learn more</button></a> matches BOTH elements but
       // renders the phrase once — count only the outermost (review, #695).
       if (el.parentElement?.closest("a, button")) continue;
@@ -240,7 +393,7 @@ export const keywordStuffingRule: Rule = {
     const ctaWordDeductions = new Map<string, number>();
     let ctaWordTotal = 0;
     for (const [label, occurrences] of ctaLabelCounts) {
-      for (const word of label.match(/[a-z]{3,}/g) || []) {
+      for (const word of keywordTokens(label)) {
         ctaWordDeductions.set(word, (ctaWordDeductions.get(word) || 0) + occurrences);
         ctaWordTotal += occurrences;
       }
@@ -251,7 +404,7 @@ export const keywordStuffingRule: Rule = {
     const suspiciousWords: { word: string; count: number; density: number }[] = [];
 
     // User-configured whitelist (lowercase for matching)
-    const whitelist = new Set(opts.whitelist.map((w) => w.toLowerCase()));
+    const whitelist = new Set(opts.whitelist.map((w) => w.normalize("NFKC").toLowerCase()));
     // The site's own brand / product name is not a keyword it is stuffing.
     for (const term of brandTerms(ctx.page.url, doc)) whitelist.add(term);
 
