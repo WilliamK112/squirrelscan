@@ -33,10 +33,12 @@ const COMMON_WORDS = wordSet(
   // Function words / generic verbs (#695) that read as high density on
   // ordinary pages, never as a real SEO target.
   "your our his her its who whom whose get here very such same each any all most much many even still yet",
-  // Price-note boilerplate repeated beside every product on English shops
-  // (#1182), not copy written to target a search term.
-  "incl vat",
 );
+
+// Price-note boilerplate repeated beside every product on English shops
+// (#1182), not copy written to target a search term. Unlike COMMON_WORDS,
+// these terms are meaningful copy in other languages (#1232).
+const ENGLISH_PRICE_NOTE_WORDS = wordSet("incl vat");
 
 const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
   [
@@ -87,6 +89,7 @@ const LANGUAGE_STOP_WORDS = new Map<string, ReadonlySet<string>>([
 const MAX_WORD_CODE_POINTS = 64;
 const MAX_MAIN_LANDMARK_CANDIDATES = 8;
 const LETTER = /^\p{L}$/u;
+const LATIN_LETTER = /^\p{Script=Latin}$/u;
 const MARK = /^\p{M}$/u;
 const UNSEGMENTED_EAST_ASIAN =
   /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
@@ -138,6 +141,20 @@ export function keywordTokens(text: string): string[] {
   }
   finishWord();
   return words;
+}
+
+/** Whether most measured letters use scripts for which the rule has no word list. */
+function hasUnsupportedScriptMajority(words: readonly string[]): boolean {
+  let latinLetters = 0;
+  let unsupportedLetters = 0;
+  for (const word of words) {
+    for (const char of word) {
+      if (!LETTER.test(char)) continue;
+      if (LATIN_LETTER.test(char)) latinLetters += 1;
+      else unsupportedLetters += 1;
+    }
+  }
+  return unsupportedLetters > latinLetters;
 }
 
 const CHROME_TAGS = new Set(["header", "nav", "footer", "aside"]);
@@ -313,10 +330,26 @@ export const keywordStuffingRule: Rule = {
       return { checks };
     }
 
+    const pageLanguage = primaryLangSubtag(doc.documentElement?.getAttribute("lang"));
+    const pageStopWords = LANGUAGE_STOP_WORDS.get(pageLanguage);
+    const usesEnglishPriceNotes = pageLanguage === "" || pageLanguage === "en";
+
     // Prefer substantial main copy. Otherwise retain body copy but drop only
     // site-wide chrome, not headers and footers inside articles or sections.
     // Both paths are non-mutating because every rule shares this document.
     const { root: contentRoot, words, isInExcludedChrome } = selectMainContent(doc, body);
+
+    // A lang attribute is page-controlled and must not turn off a scored rule.
+    // Skip only when the measured copy itself is predominantly written in a
+    // script for which the rule has no function-word list (#1232).
+    if (hasUnsupportedScriptMajority(words)) {
+      checks.push({
+        name: "keyword-stuffing",
+        status: "skipped",
+        message: "Most content uses a script without a function-word list",
+      });
+      return { checks };
+    }
 
     if (words.length < 100) {
       checks.push({
@@ -335,10 +368,6 @@ export const keywordStuffingRule: Rule = {
 
     // Find words with high density, excluding English common words and the
     // grammatical filler for the page's declared language (#1042).
-    const pageStopWords = LANGUAGE_STOP_WORDS.get(
-      primaryLangSubtag(doc.documentElement?.getAttribute("lang")),
-    );
-
     // Repeated generic nav/CTA labels ("Learn more" x11 cards) are a UI
     // component, not organic content — don't count their words toward
     // density (#695). Deliberately an ALLOWLIST of known boilerplate phrases
@@ -410,7 +439,13 @@ export const keywordStuffingRule: Rule = {
 
     if (organicTotal > 0) {
       for (const [word, rawCount] of wordCounts) {
-        if (COMMON_WORDS.has(word) || pageStopWords?.has(word)) continue;
+        if (
+          COMMON_WORDS.has(word) ||
+          pageStopWords?.has(word) ||
+          (usesEnglishPriceNotes && ENGLISH_PRICE_NOTE_WORDS.has(word))
+        ) {
+          continue;
+        }
         if (whitelist.has(word)) continue;
 
         const count = rawCount - (ctaWordDeductions.get(word) ?? 0);

@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Fixed
+
+- **Keyword-stuffing checks use the measured copy's script instead of trusting `lang`.** English, German, Spanish, French, Portuguese, Italian and Dutch copy is checked with its function-word list. Copy written mainly in another script is not judged against English words, while an unsupported `lang` alone cannot turn the check off. English price-note terms (`incl`, `VAT`) are ignored only on English pages, so they remain detectable elsewhere. (#1232)
+
 ### Added
 
 - **`[storage] store_scripts = true` (or `squirrel audit --store-scripts`) keeps the first-party scripts an audit fetched in the content store.** For corpus and research runs that analyse a crawl again later (new secret rules, new technology fingerprints, labelling) without fetching the site again. Each audit indexes its scripts by URL, with the content hash, size, final URL and the pages that load them; identical bundles are stored once; a script over `store_scripts_max_bytes` (default 2 MB) is recorded as skipped with its size, and an audit stores at most `store_scripts_total_bytes` of distinct bytes (default a quarter of `content_store_max_bytes`). The audit's own checks fetch only 10 to 50 of a site's scripts, so with this on it fetches up to `store_scripts_max_scripts` (default 200, at most 500, extra requests only while it is on, bounded to 256 MB of script text and 120 seconds) and warns with how many it left. Off by default: nothing changes unless you set it. Bodies are evicted by the content store's size cap like stored HTML, so raise `content_store_max_bytes` for a corpus. See [Storage configuration](https://docs.squirrelscan.com/configuration/storage#store_scripts). (#1255)
