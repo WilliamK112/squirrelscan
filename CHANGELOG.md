@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Added
+
+- Leaked-secret items now include the matched value's character length and zero-based source offset in `meta`; inline-script items also identify the script's position in the page. Values remain masked in reports. See [Leaked API key in client-side code](https://docs.squirrelscan.com/rules/security/leaked-secrets). (#1230)
+
 ## v0.0.141 (2026-10-29)
 
 `squirrel audit --ephemeral` uses cloud features for one run and leaves nothing behind: the site is not added to the dashboard, scheduled or published unless you pass `--publish`. `--store-scripts` keeps the first-party scripts an audit fetched in the content store. Keyword-stuffing checks use the measured copy's own script, leaked-secret checks no longer flag credential key-name constants, and CI now rejects edits to tagged CHANGELOG sections.
