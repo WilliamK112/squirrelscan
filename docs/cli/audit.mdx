@@ -291,10 +291,6 @@ publishing, no update checks, no telemetry. The site's own hosts are the audited
 host, its `www` or apex twin, the domains in `[project] domains` and the
 subdomains of all of them. Nothing goes to any other host:
 
-Probing defaults to `passive`, so the audit sends no same-site security probe
-requests beyond the crawl. Pass `--probe active` (or another explicit probing
-flag) when you want those probes during an offline run.
-
 - External links are not checked, and neither are the third-party scripts,
   stylesheets and fonts the pages load. `reliability/broken-resources` reports
   them as not measured.
@@ -310,6 +306,10 @@ flag) when you want those probes during an offline run.
   host, is checked like the site's own.
 - The soft-404 confirmation, the cloaking probe and the AI agent access probe
   stay on the site: a redirect off it is not followed.
+
+Probing defaults to `passive`, so the audit sends no active security-probe
+requests beyond the crawl. Pass `--probe active` (or another explicit probing
+flag) when you want those probes during an offline run.
 
 Results are stored in the local database as usual:
 
