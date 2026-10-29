@@ -31,6 +31,7 @@ squirrel audit <url> [options]
 | `--format` | `-f` | Output format: `console`, `text`, `json`, `html`, `markdown`, `xml`, `llm` | `console` |
 | `--output` | `-o` | Output file path | auto |
 | `--refresh` | `-r` | Ignore cache, fetch all pages fresh (full re-scan) | `false` |
+| `--store-scripts` | | Keep every fetched first-party script in the content store for this run, for corpus and research runs (see [`store_scripts`](/configuration/storage#store_scripts)) | `false` |
 | `--fresh-ua` | | Re-roll the project's pinned random user-agent (the new one is pinned for later runs) | `false` |
 | `--incremental` | | Re-scan only changed pages via conditional GET (the default; overrides `[crawler] incremental = false`) | `true` |
 | `--no-incremental` | | Fetch every page in full, disabling conditional GET | `false` |
@@ -564,6 +565,7 @@ Change the window, or turn it off, with
 | `0` | Success |
 | `1` | Error (invalid URL, crawl failed, down/blocked site, etc.) |
 | `2` | A [`--fail-on`](#gate-ci-on-audit-results) threshold tripped (CI gate) |
+| `3` | A WAF or bot manager answered the audited page with a challenge or block page, so nothing was audited (see [blocked by a WAF or bot manager](/guides/failed-audits#blocked-by-waf)) |
 
 ## Configuration
 

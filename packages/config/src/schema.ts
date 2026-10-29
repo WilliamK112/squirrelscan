@@ -206,6 +206,14 @@ export const ClassifierConfigSchema = z.object({
   enabled: z.boolean().default(true),
 });
 
+// Technology detection reads the first bytes of each first-party script bundle
+// the crawl already fetched (#1254), so a stack that lives only in a bundle
+// (a Vite or Next.js app with an empty HTML shell) is still found. Unset =
+// SERVICE_LIMITS.techDetectBundleBytes (64 KB); 0 turns bundle matching off.
+export const TechDetectConfigSchema = z.object({
+  bundle_bytes: z.number().int().min(0).max(262_144).optional(),
+}).strict();
+
 export const OutputConfigSchema = z.object({
   format: z.enum(["json", "html", "console"]).default("console"),
   path: z.string().optional(),
@@ -219,6 +227,21 @@ export const OutputConfigSchema = z.object({
 // for: `report --diff` against the previous run, and one before that as a
 // fallback when the most recent audit is the anomalous one.
 export const DEFAULT_KEEP_AUDITS = 3;
+
+/** A positive byte count written as a number or a size string such as "2MB". */
+function byteSizeField(name: string) {
+  return z.union([z.number(), z.string()]).transform((value, ctx) => {
+    const bytes = parseByteSize(value);
+    if (bytes === null) {
+      ctx.addIssue({
+        code: "custom",
+        message: `${name} must be a positive size, such as 2097152 or "2MB"`,
+      });
+      return z.NEVER;
+    }
+    return bytes;
+  });
+}
 
 export const StorageConfigSchema = z.object({
   /**
@@ -268,6 +291,32 @@ export const StorageConfigSchema = z.object({
       return bytes;
     })
     .optional(),
+  /**
+   * Keep every first-party script the crawl fetched in the content store, for
+   * corpus and research runs that re-analyse a crawl later (#1255). Off unless
+   * set: bundles are large. Deduplicated by content hash, linked from the audit
+   * (script URL to hash) and kept under the same size cap and retention as the
+   * stored HTML. `--store-scripts` turns it on for one run.
+   */
+  store_scripts: z.boolean().optional(),
+  /**
+   * Largest single script stored, in bytes or as a size string such as `"2MB"`.
+   * A bigger one is recorded as skipped, with its size. Unset = 2 MB.
+   */
+  store_scripts_max_bytes: byteSizeField("store_scripts_max_bytes").optional(),
+  /**
+   * Most distinct script bytes one audit stores (a bundle shared by many pages
+   * counts once). Past it scripts are recorded as skipped. Unset = a quarter of
+   * the content store cap (`content_store_max_bytes`).
+   */
+  store_scripts_total_bytes: byteSizeField("store_scripts_total_bytes").optional(),
+  /**
+   * Most first-party scripts one audit fetches when `store_scripts` is on, 1 to
+   * 500. The audit's own checks fetch at least 10, a tenth of the pages, at
+   * most 50; storing bundles raises that to this. Unset = 200. The extra
+   * requests are made only while `store_scripts` is on.
+   */
+  store_scripts_max_scripts: z.number().int().min(1).max(500).optional(),
 });
 
 export const CloudConfigSchema = z.object({
@@ -470,6 +519,8 @@ export const ConfigSchema = z.object({
   internal_links: InternalLinksConfigSchema.optional(),
   // Optional for the same reason: absent reads as the default (on).
   classifier: ClassifierConfigSchema.optional(),
+  // Optional for the same reason: absent reads as the default bundle cap.
+  tech_detect: TechDetectConfigSchema.optional(),
   output: OutputConfigSchema.default(defaultOutput),
   // Local disk retention (#1912) — how many audits a project keeps.
   storage: StorageConfigSchema.default(defaultStorage),
@@ -510,6 +561,7 @@ export type PluginsConfig = z.infer<typeof PluginsConfigSchema>;
 export type ExternalLinksConfig = z.infer<typeof ExternalLinksConfigSchema>;
 export type InternalLinksConfig = z.infer<typeof InternalLinksConfigSchema>;
 export type ClassifierConfig = z.infer<typeof ClassifierConfigSchema>;
+export type TechDetectConfig = z.infer<typeof TechDetectConfigSchema>;
 export type OutputConfig = z.infer<typeof OutputConfigSchema>;
 export type StorageConfig = z.infer<typeof StorageConfigSchema>;
 export type CloudConfig = z.infer<typeof CloudConfigSchema>;

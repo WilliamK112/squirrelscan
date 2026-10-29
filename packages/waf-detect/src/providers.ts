@@ -1,4 +1,4 @@
-import type { WafProvider } from "./types";
+import type { WafBlockProvider, WafProvider } from "./types";
 
 /** Header-based WAF signatures */
 export const HEADER_PATTERNS: {
@@ -12,6 +12,8 @@ export const HEADER_PATTERNS: {
       { name: "cf-ray" },
       { name: "server", pattern: /cloudflare/i },
       { name: "cf-cache-status" },
+      // Set only on a response Cloudflare answered with a challenge.
+      { name: "cf-mitigated", pattern: /^challenge$/i },
     ],
     confidence: "high",
   },
@@ -30,7 +32,7 @@ export const HEADER_PATTERNS: {
     // CloudFront, which most AWS sites use without WAF) nor `x-amzn-requestid`
     // / `x-amz-apigw-id` (API Gateway and Lambda): AWS infrastructure is not
     // the WAF (#750).
-    headers: [{ name: "x-amzn-waf-action" }],
+    headers: [{ name: "x-amzn-waf-action", pattern: /^(?:challenge|captcha)$/i }],
     confidence: "high",
   },
   {
@@ -51,7 +53,8 @@ export const HEADER_PATTERNS: {
   },
   {
     provider: "perimeterx",
-    headers: [{ name: "x-px-pp" }, { name: "x-px-gt" }],
+    // `x-px-blocked: 1` is on the block page itself, never on a served page.
+    headers: [{ name: "x-px-pp" }, { name: "x-px-gt" }, { name: "x-px-blocked" }],
     confidence: "high",
   },
   {
@@ -124,13 +127,13 @@ export const PROVIDER_PRECEDENCE: readonly WafProvider[] = [
 export const CLOUDFLARE_CHALLENGE_SCRIPT = /\/cdn-cgi\/challenge-platform\/(?:h\/[\w-]+\/)?orchestrate\//i;
 
 /** Akamai's deny-page reference id, such as `Reference #18.9d367a83.1614887475.2b3c78d`. */
-const AKAMAI_REFERENCE_ID = /reference\s*#\s*\d+\.[0-9a-f]+\.\d+\.[0-9a-f]+/i;
+export const AKAMAI_REFERENCE_ID = /reference\s*#\s*\d+\.[0-9a-f]+\.\d+\.[0-9a-f]+/i;
 
 /** Imperva's block-page line with its id: `Incapsula incident ID: 1234000280151781213-1234`. */
-const IMPERVA_INCIDENT_LINE = /incapsula incident id\s*(?::|&#58;)?\s*(?:<[^>]*>\s*)*\d/i;
+export const IMPERVA_INCIDENT_LINE = /incapsula incident id\s*(?::|&#58;)?\s*(?:<[^>]*>\s*)*\d/i;
 
 /** A dash as block pages write it: hyphen, en dash, or either as an entity. */
-const DASH = "(?:-|\\u2013|&#8211;|&ndash;)";
+export const DASH = "(?:-|\\u2013|&#8211;|&ndash;)";
 
 /**
  * Content-based WAF signatures: markup, script hosts and reference formats the
@@ -276,7 +279,10 @@ export const CONTENT_PATTERNS: {
  * Markup only a challenge or block page carries. With a challenge status or a
  * WAF's own headers or markup it marks the page as a challenge, even at 200.
  */
-export const CHALLENGE_MARKUP_SIGNATURES: { view: "markup" | "text"; pattern: RegExp }[] = [
+export const CHALLENGE_MARKUP_SIGNATURES: {
+  view: "markup" | "text";
+  pattern: RegExp;
+}[] = [
   { view: "markup", pattern: /cf-browser-verification/i },
   { view: "markup", pattern: /__cf_chl_/i },
   { view: "markup", pattern: /_cf_chl_opt/ },
@@ -290,8 +296,8 @@ export const CHALLENGE_MARKUP_SIGNATURES: { view: "markup" | "text"; pattern: Re
   // "access denied" in the 10 KB sample costs at most a 2 KB scan.
   { view: "text", pattern: /reference&#32;&#35;\s*\d/i },
   { view: "text", pattern: new RegExp(`access denied[\\s\\S]{0,2000}?${AKAMAI_REFERENCE_ID.source}`, "i") },
-  { view: "markup", pattern: /_pxCaptcha/i },
-  { view: "markup", pattern: /px-captcha/i },
+  // HUMAN's captcha mount point is classify.ts's rule, which also needs a refusal
+  // status and its app id: a bare `px-captcha` is a widget a real page can embed.
 ];
 
 /** The challenge markup patterns alone; each is read in its view (#693). */
@@ -311,6 +317,14 @@ export const CHALLENGE_TEXT_PATTERNS = [
 export const WAF_CHALLENGE_STATUS_CODES = new Set([401, 403, 429, 503]);
 
 /**
+ * The statuses a perimeter provider answers a challenge or block with, beyond
+ * `WAF_CHALLENGE_STATUS_CODES`: AWS WAF's Challenge is a 202 and its CAPTCHA a
+ * 405 (AWS WAF developer guide), and Akamai, F5, DataDome and Imperva serve
+ * their deny or challenge pages at 200.
+ */
+export const WAF_BLOCK_STATUS_CODES = new Set([200, 202, 401, 403, 405, 406, 429, 503]);
+
+/**
  * Fingerprints for provider bot-challenge interstitials served at HTTP 200 (#513).
  * DataDome/Kasada answer with 200 and no generic interstitial string, so
  * CHALLENGE_MARKUP_PATTERNS and CHALLENGE_TEXT_PATTERNS miss them. Both tiers only count on a tiny-text
@@ -327,7 +341,11 @@ export const CHALLENGE_200_SIGNATURES: {
   {
     provider: "datadome",
     // captcha-delivery.com is DataDome's captcha host — injected only on the block/challenge interstitial
-    strongMarkers: [/captcha-delivery\.com/i],
+    // Not followed by more host: `captcha-delivery.com.attacker.example` is not DataDome.
+    // Matched where a tag loads it, and not followed by more host.
+    strongMarkers: [
+      /(?:src|href|action)\s*=\s*["']?(?:https?:)?\/\/(?:[a-z0-9-]{1,63}\.){0,3}captcha-delivery\.com(?![\w-]|\.[\w-])/i,
+    ],
     weakMarkers: [],
   },
   {
@@ -342,7 +360,7 @@ export const CHALLENGE_200_SIGNATURES: {
 export const CHALLENGE_INTERSTITIAL_MAX_TEXT = 600;
 
 /** Human-readable WAF provider names */
-const WAF_PROVIDER_NAMES: Record<WafProvider, string> = {
+const WAF_PROVIDER_NAMES: Record<WafBlockProvider, string> = {
   cloudflare: "Cloudflare",
   akamai: "Akamai",
   "aws-waf": "AWS WAF",
@@ -351,10 +369,14 @@ const WAF_PROVIDER_NAMES: Record<WafProvider, string> = {
   datadome: "DataDome",
   perimeterx: "PerimeterX",
   kasada: "Kasada",
+  f5: "F5",
+  vercel: "Vercel",
+  wordfence: "Wordfence",
+  radware: "Radware",
   unknown: "Unknown WAF",
 };
 
-export function getWafProviderName(provider: WafProvider): string {
+export function getWafProviderName(provider: WafBlockProvider): string {
   return WAF_PROVIDER_NAMES[provider];
 }
 
