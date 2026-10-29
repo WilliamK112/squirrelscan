@@ -12,6 +12,8 @@ import {
   type OffSiteRedirectFollowUp,
 } from "@squirrelscan/core-contracts/offsite-redirect";
 
+import { redactUrl, type SeedRedirectHop } from "@squirrelscan/core-contracts/seed-redirect";
+
 import type { AuditReport, CheckItem } from "./types";
 import type { GroupedCheck } from "./grouping";
 import { checkAffectedPages } from "./affected-pages";
@@ -364,6 +366,71 @@ export function seedRedirectFollowUp(report: AuditReport): OffSiteRedirectFollow
   return target ? offSiteRedirectFollowUp(target) : null;
 }
 
+
+// Start URL redirects (#1281)
+const MAX_LISTED_HOPS = 10;
+const UNPRINTABLE = "(unprintable URL)";
+
+export interface FollowedStartRedirect {
+  /** The URL the user gave, canonicalised. */
+  originalUrl: string;
+  /** The destination (the chain's last URL), canonicalised. */
+  finalUrl: string;
+  chain: SeedRedirectHop[];
+  /** The disclosure as one sentence. */
+  note: string;
+}
+
+/**
+ * A site-chosen URL for display: no userinfo, query or fragment (a token or a
+ * credential must not reach a published report), and the characters markdown
+ * and HTML read as syntax percent-encoded, so the URL is plain text wherever it
+ * lands.
+ */
+export function printableReportUrl(value: unknown): string {
+  const canonical = typeof value === "string" ? canonicalizeReportUrl(value) : null;
+  if (canonical === null) return UNPRINTABLE;
+  const redacted = redactUrl(canonical);
+  return redacted.replace(/[`[\]()<>"'\\{}|^$]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+export function safeChain(chain: unknown): SeedRedirectHop[] {
+  if (!Array.isArray(chain)) return [];
+  return chain.slice(0, MAX_LISTED_HOPS).map((hop: Partial<SeedRedirectHop> | null) => ({
+    url: printableReportUrl(hop?.url),
+    status: Number.isInteger(hop?.status) ? (hop?.status as number) : 0,
+  }));
+}
+
+/** `301 https://a/ -> 200 https://b/`, the chain as one line. */
+export function chainText(chain: SeedRedirectHop[]): string {
+  return chain.map((hop) => `${hop.status || "?"} ${hop.url}`).join(" -> ");
+}
+
+/**
+ * The followed start redirect a report records, or null when the start URL did
+ * not redirect (or only within the one site: no `originalUrl` is stored then).
+ */
+export function followedStartRedirect(report: AuditReport): FollowedStartRedirect | null {
+  if (typeof report.originalUrl !== "string" || report.originalUrl.trim() === "") return null;
+  const chain = safeChain(report.redirectChain);
+  const originalUrl = printableReportUrl(report.originalUrl);
+  const finalUrl = chain.length > 0 ? chain[chain.length - 1]!.url : printableReportUrl(report.baseUrl);
+  const hops = Math.max(chain.length - 1, 1);
+  return {
+    originalUrl,
+    finalUrl,
+    chain,
+    note: `Start URL ${originalUrl} redirected to ${finalUrl} (${hops} ${hops === 1 ? "hop" : "hops"}), which is the site this audit graded.${chain.length > 1 ? ` Chain: ${chainText(chain)}.` : ""}`,
+  };
+}
+
+/** {@link followedStartRedirect}'s sentence alone, or null on the same terms. */
+export function startRedirectLine(report: AuditReport): string | null {
+  return followedStartRedirect(report)?.note ?? null;
+}
+
+
 /**
  * Canonicalize a site-controlled URL for display, or `null` for a value we are
  * not willing to print at all.
@@ -388,7 +455,7 @@ export function seedRedirectFollowUp(report: AuditReport): OffSiteRedirectFollow
  * Refusing keeps the allowlist the WHATWG parser already implements: callers
  * disclose the redirect with a fixed placeholder instead.
  */
-function canonicalizeReportUrl(value: string | undefined): string | null {
+export function canonicalizeReportUrl(value: string | undefined): string | null {
   if (!value) return null;
   try {
     const url = new URL(value);
