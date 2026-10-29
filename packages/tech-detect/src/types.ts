@@ -19,8 +19,16 @@ export type Detector =
   | { type: "header"; name: string; pattern: RegExp }
   | { type: "meta"; name: string; pattern: RegExp }
   | { type: "script-url"; pattern: RegExp }
-  | { type: "script-content"; pattern: RegExp }
-  | { type: "html"; pattern: RegExp }
+  // `inCode`: the match must start in code, not inside a comment or a string
+  // literal of the script, so a docs snippet or a commented-out call is no
+  // evidence. For config-style patterns that need a real call to mean anything.
+  // An `inCode` detector reads fetched script bodies only, never the page HTML.
+  // `hint`: a literal the match needs, searched across a whole bundle to pick
+  // the windows worth sending when the body is too big to send whole.
+  | { type: "script-content"; pattern: RegExp; inCode?: boolean; hint?: string }
+  // `requires`: literal that must appear in the html (case-sensitive) before the
+  // pattern runs, a cheap gate for patterns that scan a bounded window per tag.
+  | { type: "html"; pattern: RegExp; requires?: string }
   | { type: "dom"; selector: string }
   | { type: "url-path"; pattern: RegExp };
 
@@ -33,6 +41,13 @@ export interface TechFingerprint {
   detectors: Detector[];
   confidence?: "high" | "medium" | "low";
   versionPattern?: RegExp;
+  /**
+   * Match html and script detectors against the markup with HTML comments
+   * removed, so a commented-out tag is not evidence.
+   */
+  ignoreComments?: boolean;
+  /** Drop this detection when any of these fingerprint ids is also detected. */
+  unlessAny?: string[];
 }
 
 export interface TechDetectInput {

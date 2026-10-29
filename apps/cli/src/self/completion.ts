@@ -220,7 +220,7 @@ _squirrel_completions() {
           return 0
           ;;
       esac
-      COMPREPLY=( $(compgen -W "--max-pages -m --max-depth --concurrency --per-host --level --coverage -C --format -f --output -o --refresh -r --fresh-ua --incremental --no-incremental --resume --verbose -v --debug --trace --project-name -n --publish -p --no-publish --visibility --yes -y --render --render-mode --http --offline --external-links --no-external-links --no-internal-links --no-classifier --fail-on --header -H --header-host --rule-include --rule-exclude --disable-discovery-probes --probe -P --passive --aggressive --probe-budget --pentest --summary --include-passed --help" -- "\${cur}") )
+      COMPREPLY=( $(compgen -W "--max-pages -m --max-depth --concurrency --per-host --level --coverage -C --format -f --output -o --refresh -r --fresh-ua --store-scripts --incremental --no-incremental --resume --verbose -v --debug --trace --project-name -n --publish -p --no-publish --ephemeral --no-ephemeral --visibility --yes -y --render --render-mode --http --offline --external-links --no-external-links --no-internal-links --no-classifier --fail-on --header -H --header-host --rule-include --rule-exclude --disable-discovery-probes --probe -P --passive --aggressive --probe-budget --pentest --summary --include-passed --help" -- "\${cur}") )
       return 0
       ;;
     entities)
@@ -529,6 +529,7 @@ _squirrel() {
             '(-o --output)'{-o,--output}'[Output file path]:file:_files' \\
             '(-r --refresh)'{-r,--refresh}'[Ignore cache, fetch all pages fresh]' \\
             '--fresh-ua[Re-roll the pinned random user-agent]' \\
+            '--store-scripts[Keep fetched first-party scripts in the content store]' \\
             '--incremental[Re-scan only changed pages via conditional GET (default on)]' \\
             '--no-incremental[Fetch every page in full, disabling conditional GET]' \\
             '--resume[Resume interrupted crawl]' \\
@@ -538,6 +539,8 @@ _squirrel() {
             '(-n --project-name)'{-n,--project-name}'[Project name (overrides config and prompts)]:name' \\
             '(-p --publish)'{-p,--publish}'[Publish to reports.squirrelscan.com (default when signed in)]' \\
             '--no-publish[Skip auto-publishing this run]' \\
+            '--ephemeral[Use cloud features for this run only: no dashboard site, no schedule, no publish]' \\
+            '--no-ephemeral[Override [cloud] ephemeral = true for this run]' \\
             '--visibility[Visibility for published reports]:visibility:(public unlisted private)' \\
             '(-y --yes)'{-y,--yes}'[Skip confirmation prompts]' \\
             '--render[Force cloud browser rendering for this run]' \\
@@ -787,6 +790,7 @@ complete -c squirrel -n "__fish_seen_subcommand_from audit" -s f -l format -a "$
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -s o -l output -d "Output file path"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -s r -l refresh -d "Ignore cache, fetch all pages fresh"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l fresh-ua -d "Re-roll the pinned random user-agent"
+complete -c squirrel -n "__fish_seen_subcommand_from audit" -l store-scripts -d "Keep fetched first-party scripts in the content store"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l incremental -d "Re-scan only changed pages via conditional GET (default on)"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l no-incremental -d "Fetch every page in full, disabling conditional GET"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l resume -d "Resume interrupted crawl"
@@ -796,6 +800,8 @@ complete -c squirrel -n "__fish_seen_subcommand_from audit" -l trace -d "Enable 
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -s n -l project-name -d "Project name (overrides config and prompts)"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -s p -l publish -d "Publish to reports.squirrelscan.com (default when signed in)"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l no-publish -d "Skip auto-publishing this run"
+complete -c squirrel -n "__fish_seen_subcommand_from audit" -l ephemeral -d "Use cloud features for this run only: no dashboard site, no schedule, no publish"
+complete -c squirrel -n "__fish_seen_subcommand_from audit" -l no-ephemeral -d "Override [cloud] ephemeral = true for this run"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l visibility -a "public unlisted private" -d "Visibility for published reports"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -s y -l yes -d "Skip confirmation prompts (cloud credit spend)"
 complete -c squirrel -n "__fish_seen_subcommand_from audit" -l render -d "Force cloud browser rendering for this run"

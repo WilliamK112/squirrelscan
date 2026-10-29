@@ -80,6 +80,24 @@ jobs:
           [[ "$result" =~ $shape ]] || run_everything "unexpected classifier output"
           echo "$result" | tee -a "$GITHUB_OUTPUT"
 
+  changelog-guard:
+    name: Changelog guard
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch pull request base
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --no-tags --depth=1 origin "$BASE"
+      - name: Fetch release tags without blobs
+        run: git fetch --force --quiet --depth=1 --filter=blob:none origin 'refs/tags/v*:refs/tags/v*'
+      - name: Check released changelog sections
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/check-released-changelog.sh "$BASE"
+
   quality:
     name: Format, lint, and typecheck
     needs: changes

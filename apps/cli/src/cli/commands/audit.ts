@@ -69,6 +69,7 @@ import { stopInterruptedCrawls } from "@/audit/stop-interrupted-crawl";
 import { findConfigFile, getGlobalConfigPath, loadConfig } from "@/config";
 import {
   DASHBOARD_URL,
+  EXIT_CODE_WAF_BLOCKED,
   MAX_PAGES_CAP,
   MAX_CRAWL_CONCURRENCY,
   STATUS_REQUEST_TIMEOUT_MS,
@@ -805,6 +806,9 @@ export function resolvePublishDecision(opts: {
   // #1841: the audited host is loopback / RFC1918 / link-local, so no hosted
   // service can ever reach it.
   nonPublicHost?: boolean;
+  // #3649: an ephemeral run publishes nothing on its own; only an explicit
+  // --publish does, and then the report is unlisted and attached to no website.
+  ephemeral?: boolean;
 }): boolean {
   // BEFORE explicitPublish, unlike every other opt-out here. The rest of this
   // function resolves a PREFERENCE, and an explicit --publish rightly wins
@@ -814,6 +818,7 @@ export function resolvePublishDecision(opts: {
   // #1841 is about. The audit still runs and still prints its report.
   if (opts.nonPublicHost) return false;
   if (opts.offline) return false;
+  if (opts.ephemeral && !opts.explicitPublish) return false;
   if (opts.explicitPublish) return true; // explicit --publish overrides opt-outs (still needs login; publishReport errors otherwise)
   if (opts.ruleFilterActive) return false;
   if (opts.noPublish || !opts.configPublish) return false;
@@ -938,6 +943,8 @@ export function validateAuditFlags(args: {
   offline?: boolean;
   publish?: boolean;
   noPublish?: boolean;
+  ephemeral?: boolean;
+  noEphemeral?: boolean;
   render?: boolean;
   http?: boolean;
   externalLinks?: boolean;
@@ -951,6 +958,9 @@ export function validateAuditFlags(args: {
   // --no-publish (skip publishing) contradicts --publish (force publishing).
   if (args.noPublish && args.publish) {
     return "--no-publish cannot be combined with --publish";
+  }
+  if (args.ephemeral && args.noEphemeral) {
+    return "--ephemeral cannot be combined with --no-ephemeral";
   }
   // repo#2729: an offline audit never requests other sites.
   if (args.offline && args.externalLinks) {
@@ -1052,6 +1062,11 @@ export const audit = defineCommand({
       alias: "r",
       description: "Ignore cache, fetch all pages fresh (full re-scan)",
     },
+    "store-scripts": {
+      type: "boolean",
+      description:
+        "Keep every fetched first-party script in the content store for this run, for corpus and research runs (same as [storage] store_scripts = true; large, see store_scripts_max_bytes)",
+    },
     "fresh-ua": {
       type: "boolean",
       description:
@@ -1096,6 +1111,16 @@ export const audit = defineCommand({
       type: "boolean",
       description:
         "Skip auto-publishing this run (stay online, just don't publish)",
+    },
+    ephemeral: {
+      type: "boolean",
+      description:
+        "Use cloud features for this run only: don't add the site to your dashboard, don't schedule it, and don't publish the report",
+    },
+    // Declared for help and completions only; read from rawArgs like --no-publish.
+    "no-ephemeral": {
+      type: "boolean",
+      description: "Override [cloud] ephemeral = true for this run",
     },
     yes: {
       type: "boolean",
@@ -1268,6 +1293,10 @@ export const audit = defineCommand({
       publish:
         !!args.publish || (noPublish && hasFlag(rawArgs, "publish", ["p"])),
       noPublish,
+      // From argv: citty turns --no-ephemeral into ephemeral: false, which is
+      // indistinguishable from "absent" for a flag that overrides config.
+      ephemeral: hasFlag(rawArgs, "ephemeral") && args.ephemeral !== false,
+      noEphemeral: hasNegatedFlag(rawArgs, "ephemeral"),
       externalLinks: externalLinksOn,
       noExternalLinks: externalLinksOff,
     });
@@ -1434,6 +1463,13 @@ export const audit = defineCommand({
       const configPath = getGlobalConfigPath() ?? findConfigFile() ?? undefined;
       const config = await loadConfig(configPath, { silent: true });
 
+      // #3649: `[cloud] ephemeral` is the default, the flags override it per run.
+      const ephemeral = hasNegatedFlag(rawArgs, "ephemeral")
+        ? false
+        : hasFlag(rawArgs, "ephemeral") && args.ephemeral !== false
+          ? true
+          : config.cloud.ephemeral;
+
       // --fail-on score:<category> against a category the --rule-include/
       // --rule-exclude filter excludes can never trip (no data that run) —
       // reject it before crawling rather than silently no-op the gate. #1066
@@ -1556,6 +1592,10 @@ export const audit = defineCommand({
       let cloudOutage: "expired" | "unreachable" | null = null;
       if (args.offline) {
         kv("Account", fmt.dim("offline (--offline) — cloud features disabled"));
+        // #3649: accepted, and a no-op: offline already saves nothing.
+        if (ephemeral) {
+          log(fmt.dim("--ephemeral has no effect offline: nothing is saved."));
+        }
       } else if (statusClient && accountLabel) {
         try {
           const { balance, plan, branding, upgrade } =
@@ -1632,6 +1672,12 @@ export const audit = defineCommand({
           `not signed in — run ${fmt.bold("squirrel auth login")} to unlock cloud features`
         );
         kv("Dashboard", fmt.cyan(DASHBOARD_URL));
+      }
+      if (ephemeral && signedIn && !args.offline) {
+        kv(
+          "Mode",
+          "ephemeral: cloud features for this run only (no dashboard site, no schedule)"
+        );
       }
 
       // Resolve the audit level: --level / -C > --pentest (full) > [crawler]
@@ -1833,6 +1879,7 @@ export const audit = defineCommand({
         outputPath: args.output,
         refresh: args.refresh,
         freshUa: args["fresh-ua"],
+        storeScripts: args["store-scripts"] ? true : undefined,
         incremental: args.incremental,
         resume: args.resume,
         verbose: args.verbose,
@@ -2180,6 +2227,7 @@ export const audit = defineCommand({
               {
                 url: args.url,
                 mode: "audit",
+                ephemeral,
                 // #271 phase 6: runner metadata (who/where ran it) stored on the
                 // run's config jsonb; surfaced in the dashboard audit-detail header.
                 config: {
@@ -2552,6 +2600,25 @@ export const audit = defineCommand({
           log(line);
       }
 
+      // #3649: an older server ignores `ephemeral` and registers the run the
+      // ordinary way (website found or created, schedule intent written). Never
+      // stay quiet about that: the run was supposed to leave nothing behind.
+      // Not when the server skipped the website itself (#1841): then there is
+      // nothing to have been added, whatever it echoed.
+      const serverIgnoredEphemeral =
+        ephemeral &&
+        !!registeredRun &&
+        !registeredRun.ephemeral &&
+        !registeredRun.websiteSkippedReason;
+      if (serverIgnoredEphemeral) {
+        log(
+          fmt.yellow(
+            "⚠ This server did not honour --ephemeral (it may predate it): the site may have been added to your dashboard and scheduled, and nothing is published. Check " +
+              DASHBOARD_URL
+          )
+        );
+      }
+
       // Handle errors
       if (!result.ok) {
         commandResult = "error";
@@ -2828,15 +2895,18 @@ export const audit = defineCommand({
       // …), forwarded to finalizeTracked so the API can classify a publish failure —
       // refund the whole audit for size/server-class failures, never for auth/user ones.
       let autoPublishErrorCode: string | null = null;
-      const shouldPublish = resolvePublishDecision({
-        signedIn,
-        offline: !!args.offline,
-        explicitPublish: !!args.publish,
-        noPublish,
-        configPublish: config.cloud.publish,
-        ruleFilterActive,
-        nonPublicHost: !!nonPublicHost,
-      });
+      const shouldPublish =
+        !serverIgnoredEphemeral &&
+        resolvePublishDecision({
+          signedIn,
+          offline: !!args.offline,
+          explicitPublish: !!args.publish,
+          noPublish,
+          configPublish: config.cloud.publish,
+          ruleFilterActive,
+          nonPublicHost: !!nonPublicHost,
+          ephemeral,
+        });
       // #1841: one line, and only when the host is the deciding factor — a
       // signed-out or --no-publish run was never going to publish, and saying
       // "kept local" there would read as a new restriction. Covers the skipped
@@ -2861,6 +2931,7 @@ export const audit = defineCommand({
           configPublish: config.cloud.publish,
           ruleFilterActive,
           nonPublicHost: false,
+          ephemeral,
         })
       ) {
         log(fmt.dim(LOCAL_HOST_NOT_PUBLISHED_LINE));
@@ -2875,6 +2946,7 @@ export const audit = defineCommand({
         configPublish: config.cloud.publish,
         ruleFilterActive: false,
         nonPublicHost: !!nonPublicHost,
+        ephemeral,
       });
       if (!shouldPublish && wouldPublishWithoutFilter && ruleFilterActive) {
         log(
@@ -2903,9 +2975,11 @@ export const audit = defineCommand({
           "unlisted",
           "private",
         ];
+        // #3649: an ephemeral report is unlisted unless --visibility says
+        // otherwise (the server downgrades public to unlisted for it).
         const visibility =
           (args.visibility as ReportVisibility) ??
-          config.cloud.visibility ??
+          (ephemeral ? undefined : config.cloud.visibility) ??
           "unlisted";
 
         // Auto-publish runs as a side effect of a successful audit, so a publish
@@ -2928,7 +3002,10 @@ export const audit = defineCommand({
             visibility,
             auditId: registeredRun?.auditId,
             runId: registeredRun?.runId,
-            websiteId: registeredRun?.websiteId ?? undefined,
+            // #3649: never attached to a dashboard website when ephemeral.
+            websiteId: ephemeral
+              ? undefined
+              : (registeredRun?.websiteId ?? undefined),
             // #1167: surface the degrade-pass clip notice on stderr-safe `log`.
             onWarn: (msg) => log(fmt.yellow(`⚠ ${msg}`)),
           });
@@ -2976,6 +3053,9 @@ export const audit = defineCommand({
             }
             log("");
             log(publishResult.data.url);
+            if (ephemeral) {
+              log(fmt.dim("This report is not attached to a dashboard site."));
+            }
 
             // #2184: recurring audits switch themselves on after a site's first
             // completed cloud audit, so this is where the CLI tells its user a
@@ -2986,7 +3066,7 @@ export const audit = defineCommand({
             const scheduleLine = scheduleSummaryLine(
               publishResult.data.schedule
             );
-            if (scheduleLine) log(scheduleLine);
+            if (scheduleLine && !ephemeral) log(scheduleLine);
 
             if (report.crawlId && storeProject) {
               await savePublishedReportInfo(
@@ -3050,6 +3130,11 @@ export const audit = defineCommand({
       // coverage or 0 credits, used to show nothing beyond "Credits used: 0"),
       // then issue link and feedback command
       const footerLines: string[] = [];
+      if (ephemeral && signedIn && registeredRun && !args.offline) {
+        footerLines.push(
+          `${fmt.dim("Ephemeral run:")} cloud features used for this run only. Not added to your dashboard, not scheduled${publishedReportId ? "" : ", not published"}.`
+        );
+      }
       if (!args.offline) {
         if (signedIn) {
           const spent = report.cloudSpend?.totalSpent ?? 0;
@@ -3064,7 +3149,7 @@ export const audit = defineCommand({
               ? ` · balance ${spent > 0 ? "~" : ""}${after.toLocaleString("en-US")}`
               : "";
           footerLines.push(
-            `${fmt.dim("Credits used:")} ${spent}${balancePart}  •  ${fmt.cyan(DASHBOARD_URL)}`
+            `${fmt.dim("Credits used:")} ${spent}${balancePart}${ephemeral ? "" : `  •  ${fmt.cyan(DASHBOARD_URL)}`}`
           );
           // #780: signed-in runs with skipped cloud rules (quick coverage, 0
           // credits) used to show nothing beyond "Credits used: 0" — surface
@@ -3089,6 +3174,7 @@ export const audit = defineCommand({
           // no idea what publishing gets them. Said exactly once, and never at
           // all once anything has been published.
           if (
+            !ephemeral &&
             shouldShowPublishNudge({
               signedIn,
               offline: !!args.offline,
@@ -3133,6 +3219,12 @@ export const audit = defineCommand({
       // explicit --fail-on gate, so CI doesn't read a down site as success.
       if (report.status === "failed" || report.status === "blocked") {
         process.exitCode = 1;
+        // #1253: the audited page was a WAF or bot-manager challenge or block
+        // page. A distinct code, so a batch or CI job can tell "the site's
+        // perimeter refused us" from a down site.
+        if (report.status === "blocked" && report.wafBlocked?.seed) {
+          process.exitCode = EXIT_CODE_WAF_BLOCKED;
+        }
       }
 
       // First-run funnel: the install's first audit reports once, as success

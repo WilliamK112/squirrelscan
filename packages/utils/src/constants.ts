@@ -513,6 +513,7 @@ export type FeedbackSource = (typeof FEEDBACK_SOURCES)[number];
 export const TECH_DETECT_HEADER_NAMES = [
   "cdn-pullzone",
   "cf-cache-status",
+  "cf-mitigated",
   "cf-ray",
   "fly-request-id",
   "server",
@@ -545,6 +546,7 @@ export const TECH_DETECT_HEADER_NAMES = [
   "x-nf-request-id",
   "x-powered-by",
   "x-provided-by",
+  "x-px-blocked",
   "x-px-gt",
   "x-px-pp",
   "x-render-origin-server",
@@ -556,6 +558,7 @@ export const TECH_DETECT_HEADER_NAMES = [
   "x-varnish",
   "x-vercel-cache",
   "x-vercel-id",
+  "x-vercel-mitigated",
 ] as const;
 /** Longest value kept per header in TECH_DETECT_HEADER_NAMES. */
 export const TECH_DETECT_HEADER_MAX_CHARS = 512;
@@ -578,7 +581,6 @@ export const TECH_DETECT_PRESENCE_HEADERS: ReadonlySet<string> = new Set([
   "x-amz-cf-id",
   "x-amz-cf-pop",
   "x-amz-request-id",
-  "x-amzn-waf-action",
   "x-datadome",
   "x-dd-b",
   "x-ec-debug",
@@ -590,6 +592,7 @@ export const TECH_DETECT_PRESENCE_HEADERS: ReadonlySet<string> = new Set([
   "x-kpsdk-ct",
   "x-kpsdk-r",
   "x-nf-request-id",
+  "x-px-blocked",
   "x-px-gt",
   "x-px-pp",
   "x-render-origin-server",
@@ -599,3 +602,21 @@ export const TECH_DETECT_PRESENCE_HEADERS: ReadonlySet<string> = new Set([
   "x-vercel-cache",
   "x-vercel-id",
 ]);
+
+/**
+ * Scripts kept in the content store when `[storage] store_scripts` is on (#1255).
+ * `maxBytes` is the per-file cap; the per-audit total defaults to
+ * `totalFraction` of the content store cap.
+ */
+export const STORED_SCRIPT_LIMITS = {
+  maxBytes: 2 * 1024 * 1024,
+  totalFraction: 0.25,
+  /** Scripts fetched per audit when storing them (`store_scripts_max_scripts`); the audit's own checks fetch fewer. */
+  maxScripts: 200,
+  /** Ceiling for `store_scripts_max_scripts`: the fetched bodies are held for the rules phase, so memory scales with it. */
+  maxScriptsCeiling: 500,
+  /** Decoded script bytes an audit holds while storing scripts; later scripts are not fetched (`memory-cap`). */
+  heldBytes: 256 * 1024 * 1024,
+  /** Wall-clock budget for the whole script fetch while storing scripts; later scripts are not fetched (`time-budget`). */
+  fetchTimeBudgetMs: 120_000,
+} as const;
