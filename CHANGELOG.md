@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Added
+
+- Technology detection recognises Lovable, Base44, Replit and v0 apps, and the Supabase, Clerk and Firebase client SDKs. Each reads only what a stored page holds: generator and author meta tags, platform script URLs, app hosts such as `*.base44.app` or `*.replit.app`, inline client config, and storage image URLs. A page that only mentions a product, links to one of its assets or shows its code in a sample does not match, and a Base44 app is not also reported as Supabase for the shared storage it loads images from. The existing Firebase Hosting signature is unchanged. See [Technology detection](https://docs.squirrelscan.com/cloud/technologies). (#1242)
+
 ### Fixed
 
 - **Keyword-stuffing checks use the measured copy's script instead of trusting `lang`.** English, German, Spanish, French, Portuguese, Italian and Dutch copy is checked with its function-word list. Copy written mainly in another script is not judged against English words, while an unsupported `lang` alone cannot turn the check off. English price-note terms (`incl`, `VAT`) are ignored only on English pages, so they remain detectable elsewhere. (#1232)
