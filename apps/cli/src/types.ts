@@ -200,6 +200,7 @@ import type {
   GroupScore as _GS,
   HealthScore as _HS,
   RefusedFetch,
+  WafBlockedSummary,
   ReportStructure as _RST,
   ReportTechnologies as _RT,
   RuleCategory as _RC,
@@ -482,6 +483,12 @@ export interface AuditReport {
    * it has to be declared in both.
    */
   refusedFetches?: RefusedFetch[];
+  /**
+   * Pages a WAF or bot manager answered with a challenge or block page (#1253).
+   * Mirrors the field on the engine's AuditReport; the two types are
+   * structurally different, so it has to be declared in both.
+   */
+  wafBlocked?: WafBlockedSummary;
   siteChecks: CheckResult[];
   pages: PageAudit[];
   summary: {
@@ -701,6 +708,7 @@ export interface AuditOptions {
     | "llm";
   outputPath?: string;
   refresh?: boolean; // ignore cache, fetch all pages fresh
+  storeScripts?: boolean; // #1255: keep fetched first-party scripts in the content store for this run
   freshUa?: boolean; // re-roll the project's sticky random user-agent (#875)
   incremental?: boolean; // force conditional-GET re-scan on/off (overrides [crawler] incremental); --refresh wins
   resume?: boolean; // resume interrupted crawl for this domain

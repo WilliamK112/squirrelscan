@@ -69,6 +69,7 @@ import { stopInterruptedCrawls } from "@/audit/stop-interrupted-crawl";
 import { findConfigFile, getGlobalConfigPath, loadConfig } from "@/config";
 import {
   DASHBOARD_URL,
+  EXIT_CODE_WAF_BLOCKED,
   MAX_PAGES_CAP,
   MAX_CRAWL_CONCURRENCY,
   STATUS_REQUEST_TIMEOUT_MS,
@@ -1039,6 +1040,11 @@ export const audit = defineCommand({
       alias: "r",
       description: "Ignore cache, fetch all pages fresh (full re-scan)",
     },
+    "store-scripts": {
+      type: "boolean",
+      description:
+        "Keep every fetched first-party script in the content store for this run, for corpus and research runs (same as [storage] store_scripts = true; large, see store_scripts_max_bytes)",
+    },
     "fresh-ua": {
       type: "boolean",
       description:
@@ -1818,6 +1824,7 @@ export const audit = defineCommand({
         outputPath: args.output,
         refresh: args.refresh,
         freshUa: args["fresh-ua"],
+        storeScripts: args["store-scripts"] ? true : undefined,
         incremental: args.incremental,
         resume: args.resume,
         verbose: args.verbose,
@@ -3118,6 +3125,12 @@ export const audit = defineCommand({
       // explicit --fail-on gate, so CI doesn't read a down site as success.
       if (report.status === "failed" || report.status === "blocked") {
         process.exitCode = 1;
+        // #1253: the audited page was a WAF or bot-manager challenge or block
+        // page. A distinct code, so a batch or CI job can tell "the site's
+        // perimeter refused us" from a down site.
+        if (report.status === "blocked" && report.wafBlocked?.seed) {
+          process.exitCode = EXIT_CODE_WAF_BLOCKED;
+        }
       }
 
       // First-run funnel: the install's first audit reports once, as success
