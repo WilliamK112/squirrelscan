@@ -1,4 +1,4 @@
-// #1225: --offline is a read-only crawl by default, even at the surface level.
+// #1225: --offline is a read-only crawl by default at every audit level.
 // A real local server exposes a discovered GraphQL endpoint so an active run
 // proves the fixture can receive probes while the default offline run cannot.
 
@@ -64,7 +64,10 @@ function cleanEnv(): Record<string, string> {
   };
 }
 
-async function run(probe?: "active"): Promise<number> {
+async function run(
+  level: "surface" | "full",
+  probe?: "active"
+): Promise<number> {
   const proc = Bun.spawn(
     [
       process.execPath,
@@ -74,7 +77,7 @@ async function run(probe?: "active"): Promise<number> {
       site.url.origin,
       "--offline",
       "--level",
-      "surface",
+      level,
       "--max-pages",
       "1",
       "--no-incremental",
@@ -99,12 +102,17 @@ const graphqlQueries = () =>
     );
 
 describe("squirrel audit --offline probing", () => {
-  test("surface sends no GraphQL probe unless active probing is explicit", async () => {
-    expect(await run()).toBe(0);
-    expect(graphqlQueries()).toEqual([]);
+  test.each([["surface"], ["full"]] as const)(
+    "%s sends no GraphQL probe by default",
+    async (level) => {
+      expect(await run(level)).toBe(0);
+      expect(graphqlQueries()).toEqual([]);
+    },
+    120_000
+  );
 
-    requests = [];
-    expect(await run("active")).toBe(0);
+  test("explicit active probing still sends a GraphQL probe", async () => {
+    expect(await run("surface", "active")).toBe(0);
     expect(graphqlQueries().length).toBeGreaterThan(0);
   }, 120_000);
 });
