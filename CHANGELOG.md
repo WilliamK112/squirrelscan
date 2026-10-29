@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Added
+
+- Technology detection recognises Lovable, Base44, Replit and v0 apps, and the Supabase, Clerk and Firebase client SDKs. Each reads only what a stored page holds: generator and author meta tags, platform script URLs, app hosts such as `*.base44.app` or `*.replit.app`, inline client config, and storage image URLs. A page that only mentions a product, links to one of its assets or shows its code in a sample does not match, and a Base44 app is not also reported as Supabase for the shared storage it loads images from. The existing Firebase Hosting signature is unchanged. See [Technology detection](https://docs.squirrelscan.com/cloud/technologies). (#1242)
+
 ### Fixed
 
 - `squirrel audit --offline` now defaults probing to `passive` at every audit level, so a surface or full offline audit sends no same-site security probe requests beyond its crawl unless `--probe`, `--passive`, `--aggressive` or `--pentest` explicitly opts in. The run banner shows the resolved probing level. (#1225)
