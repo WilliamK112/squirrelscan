@@ -46,7 +46,7 @@ squirrel audit <url> [options]
 | `--render` | | Force cloud browser rendering for this run: alias of `--render-mode all` ([uses credits](/guides/browser-rendering); requires login) | auto |
 | `--render-mode` | | Render strategy: `off` (HTTP only) · `auto` (render only client-rendered pages) · `all` (render every page). Overrides `[cloud].render` | the level's: `auto` for quick, `all` for surface and full |
 | `--http` | | Force plain HTTP for this run: alias of `--render-mode off` (never render in the cloud; pages cost the same either way) | auto |
-| `--offline` | | Run fully offline: skip cloud features, publishing, and telemetry. No request goes to a host outside the audited site (its host, its `www` or apex twin, `[project] domains` and their subdomains): external links, third-party scripts, stylesheets and fonts, sitemaps on another site, and redirects to another site are not requested. Internal link targets still are checked. See [Fully offline audit](#fully-offline-audit) | `false` |
+| `--offline` | | Run fully offline: skip cloud features, publishing, and telemetry. Probing defaults to `passive` unless you explicitly pass `--probe`, `--passive`, `--aggressive` or `--pentest`. No request goes to a host outside the audited site (its host, its `www` or apex twin, `[project] domains` and their subdomains): external links, third-party scripts, stylesheets and fonts, sitemaps on another site, and redirects to another site are not requested. Internal link targets still are checked. See [Fully offline audit](#fully-offline-audit) | `false` |
 | `--external-links` | | Check links to other sites this run, even where `[external_links] enabled = false` turns them off. Cannot be combined with `--offline` or `--no-external-links` | the level's: on at every level |
 | `--no-external-links` | | Do not check links to other sites this run. The report shows them as **Not checked** | the level's |
 | `--no-internal-links` | | Do not status-check internal link targets the crawl did not fetch (one `HEAD` request each, on by default at every level). See [Link checking defaults](/rules/links#link-checking-defaults) | checked |
@@ -56,7 +56,7 @@ squirrel audit <url> [options]
 | `--rule-include` | | Only run these rule categories or rules, e.g. `ax,perf` or `core/meta-title` (repeatable / comma-separated). Replaces `[rules] enable` for this run | none |
 | `--rule-exclude` | | Skip these rule categories or rules, e.g. `images,social` (repeatable / comma-separated). Adds to `[rules] disable` for this run | none |
 | `--disable-discovery-probes` | | Skip the pre-crawl discovery probes (`llms.txt`, `/.well-known/*`, `/swagger.json` and the rest) for this run. Overrides `[crawler] disable_discovery_probes`; `=false` sends them even when the config turns them off. See [Discovery probes](/configuration/crawler#discovery-probes) | `false` |
-| `--probe` | `-P` | Probing intensity: `passive`, `active` or `aggressive`. Overrides `[security] probe`. See [Probing intensity](#probing-intensity) | the level's: `passive` for quick, `active` for surface and full |
+| `--probe` | `-P` | Probing intensity: `passive`, `active` or `aggressive`. Overrides `[security] probe` and the `--offline` passive default. See [Probing intensity](#probing-intensity) | with `--offline`: `passive`; otherwise the level's: `passive` for quick, `active` for surface and full |
 | `--passive` | | Shortcut for `--probe passive` | `false` |
 | `--aggressive` | | Shortcut for `--probe aggressive` | `false` |
 | `--probe-budget` | | Wall-clock cap for all probing in this run, such as `30s` or `2m` (max `1h`). Overrides `[security] budget` | `30s` active, `2m` aggressive |
@@ -108,8 +108,11 @@ the page budget and rendering.
 | `active` | Quiet probes: a handful of requests that look like normal traffic |
 | `aggressive` | Loud probes: many requests and many 404s, which can trip a WAF |
 
-The audit level picks the default: `passive` for quick, `active` for surface and
-full. `aggressive` is never a default. The audit prints the level and its budget
+The audit level normally picks the default: `passive` for quick, `active` for
+surface and full. With `--offline`, the default is always `passive`, including
+when `[security] probe` sets another level. An explicit `--probe`, `--passive`,
+`--aggressive` or `--pentest` still opts in to that probing level. `aggressive`
+is never a default. The audit prints the level it actually uses and its budget
 in the run banner:
 
 ```text
@@ -284,6 +287,10 @@ Run an audit with no cloud and no requests to other sites: no cloud analysis, no
 publishing, no update checks, no telemetry. The site's own hosts are the audited
 host, its `www` or apex twin, the domains in `[project] domains` and the
 subdomains of all of them. Nothing goes to any other host:
+
+Probing defaults to `passive`, so the audit sends no same-site security probe
+requests beyond the crawl. Pass `--probe active` (or another explicit probing
+flag) when you want those probes during an offline run.
 
 - External links are not checked, and neither are the third-party scripts,
   stylesheets and fonts the pages load. `reliability/broken-resources` reports

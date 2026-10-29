@@ -857,8 +857,9 @@ export function probeFlagsFromArgs(args: Record<string, unknown>): ProbeFlags {
  * Resolve probing intensity for a local CLI run (see resolveProbeIntensity in
  * @squirrelscan/config, which the hosted runner shares). Mirrors
  * resolveExplicitRenderMode: flags > config > the audit level's probe setting
- * > context default. A local run is never locked; the cloud inputs are the
- * hosted caller's to supply.
+ * > context default. Offline runs default to passive unless a probing flag
+ * explicitly opts into another level. A local run is never locked; the cloud
+ * inputs are the hosted caller's to supply.
  */
 export function resolveLocalProbeIntensity(opts: {
   flags: ProbeFlags;
@@ -877,6 +878,8 @@ export function resolveLocalProbeIntensity(opts: {
   coverage?: string;
   /** The level the run resolved to; its probe setting is the default. */
   level?: AuditLevel;
+  /** --offline defaults to passive unless a probing flag was explicit. */
+  offline?: boolean;
 }): ProbeResolution {
   const context: ProbeRunContext = {
     surface: "local",
@@ -889,14 +892,24 @@ export function resolveLocalProbeIntensity(opts: {
     opts.level === undefined
       ? undefined
       : AUDIT_LEVEL_PRESETS[opts.level].probe;
+  const hasExplicitProbeLevel =
+    opts.flags.probe !== undefined ||
+    opts.flags.passive === true ||
+    opts.flags.aggressive === true ||
+    opts.flags.pentest === true;
+  const offlineDefault = opts.offline === true && !hasExplicitProbeLevel;
+  const defaultProbe = offlineDefault ? "passive" : levelProbe;
   return resolveProbeIntensity({
     flags: opts.flags,
-    config: opts.config.security,
+    config: {
+      ...opts.config.security,
+      ...(offlineDefault ? { probe: undefined } : {}),
+    },
     context,
     coverage: opts.coverage,
     // No level defaults to aggressive (core-contracts pins it), so this never drops a value.
-    ...(levelProbe !== undefined && levelProbe !== "aggressive"
-      ? { levelDefault: levelProbe }
+    ...(defaultProbe !== undefined && defaultProbe !== "aggressive"
+      ? { levelDefault: defaultProbe }
       : {}),
   });
 }
@@ -1108,7 +1121,7 @@ export const audit = defineCommand({
     offline: {
       type: "boolean",
       description:
-        "Run fully offline: skip cloud features, publishing, telemetry, and any request to another site",
+        "Run fully offline: skip cloud features, publishing, telemetry, and any request to another site; probing defaults to passive unless explicitly set",
     },
     // repo#2729: internal and external link checks are on at every level
     // (pub#823). --external-links turns external ones back on over
@@ -1175,7 +1188,7 @@ export const audit = defineCommand({
       type: "string",
       alias: "P",
       description:
-        "Probing intensity: passive (no requests beyond the crawl) | active (quiet probes that look like normal traffic) | aggressive (loud probes, can trip a WAF). Default: active if signed in, passive if not. Overrides [security] probe",
+        "Probing intensity: passive (no requests beyond the crawl) | active (quiet probes that look like normal traffic) | aggressive (loud probes, can trip a WAF). Defaults to passive with --offline; otherwise follows the audit level. Overrides [security] probe",
     },
     passive: {
       type: "boolean",
@@ -1653,8 +1666,9 @@ export const audit = defineCommand({
         config.smart_audits ?? defaultSmartAudits(accountPlan, cloudOutage);
 
       // Probing intensity: --probe > --passive/--aggressive/--pentest >
-      // [security] probe > the level's probe setting (quick passive, surface
-      // and full active). Disabled discovery probes force passive.
+      // the offline passive default > [security] probe > the level's probe
+      // setting (quick passive, surface and full active). Disabled discovery
+      // probes force passive.
       const probeResolution = resolveLocalProbeIntensity({
         flags: probeFlags,
         config,
@@ -1662,6 +1676,7 @@ export const audit = defineCommand({
         disableDiscoveryProbes,
         coverage: levelFlag.raw,
         level,
+        offline: !!args.offline,
       });
       if (!probeResolution.ok) {
         console.error(`${fmt.red("Error:")} ${probeResolution.error}`);

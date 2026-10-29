@@ -109,7 +109,10 @@ beforeEach(() => {
     if (url.pathname === "/" || url.pathname === "") {
       return new Response(
         "<html><head><title>t</title></head><body><h1>h</h1></body></html>",
-        { status: 200, headers: { "Content-Type": "text/html" } }
+        {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        }
       );
     }
     return new Response("not found", { status: 404 });
@@ -170,11 +173,17 @@ describe("signed out and online, probing follows the level", () => {
 describe("squirrel audit --level", () => {
   test.each([
     [["--level", "quick"], "quick · max 25 pages"],
-    [["--level", "surface"], "surface · max 100 pages"],
-    [["--level", "full"], "full · max 500 pages"],
+    [
+      ["--level", "surface"],
+      "custom (surface + probe passive) · max 100 pages",
+    ],
+    [["--level", "full"], "custom (full + probe passive) · max 500 pages"],
     // The old flag and the old name for quick still work.
     [["-C", "fast"], "quick · max 25 pages"],
-    [["--coverage", "surface"], "surface · max 100 pages"],
+    [
+      ["--coverage", "surface"],
+      "custom (surface + probe passive) · max 100 pages",
+    ],
   ])("%p prints `Level %s`", async (flags, banner) => {
     await runAudit(flags);
     expect(process.exitCode).toBe(0);
@@ -202,26 +211,31 @@ describe("squirrel audit --level", () => {
     expect(options.auditLevel?.settings.cloudChecks).toBe(false);
   });
 
-  test("surface's settings reach the controller as defaults", async () => {
+  test("offline surface defaults probing to passive", async () => {
     await runAudit(["--level", "surface"]);
     const options = runs[0]!;
     expect(options.coverageMode).toBe("surface");
     expect(options.maxPages).toBe(100);
     expect(options.externalLinksEnabled).toBe(true);
     expect(options.renderStrategy).toBe("all");
-    expect(options.probe?.level).toBe("active");
-    expect(line("Probing")).toBe("active · budget 30s");
+    expect(options.probe?.level).toBe("passive");
+    expect(line("Probing")).toBe("passive · no requests beyond the crawl");
+    expect(line("Level")).toBe(
+      "custom (surface + probe passive) · max 100 pages"
+    );
     expect(options.auditLevel?.settings.cloudChecks).toBe(true);
   });
 
   test("--max-pages makes it custom and the banner names the change", async () => {
     await runAudit(["--level", "surface", "--max-pages", "200"]);
-    expect(line("Level")).toBe("custom (surface + max_pages 200)");
+    expect(line("Level")).toBe(
+      "custom (surface + max_pages 200, probe passive)"
+    );
     expect(runs[0]?.maxPages).toBe(200);
     expect(runs[0]?.auditLevel).toMatchObject({
       level: "custom",
       basedOn: "surface",
-      changes: ["pages"],
+      changes: ["pages", "probe"],
     });
   });
 
@@ -232,7 +246,9 @@ describe("squirrel audit --level", () => {
 
   test("--http on surface: custom, render off, page count kept", async () => {
     await runAudit(["--level", "surface", "--http"]);
-    expect(line("Level")).toBe("custom (surface + render off) · max 100 pages");
+    expect(line("Level")).toBe(
+      "custom (surface + render off, probe passive) · max 100 pages"
+    );
   });
 
   test("--probe passive on surface is custom", async () => {
@@ -243,6 +259,20 @@ describe("squirrel audit --level", () => {
     expect(runs[0]?.probe?.level).toBe("passive");
   });
 
+  test.each([
+    [["--probe", "active"], "active"],
+    [["--aggressive"], "aggressive"],
+    [["--pentest"], "aggressive"],
+  ] as const)(
+    "offline %p preserves the explicit %s probe",
+    async (flags, probe) => {
+      await runAudit(["--level", "full", ...flags]);
+      expect(process.exitCode).toBe(0);
+      expect(runs[0]?.probe?.level).toBe(probe);
+      expect(line("Probing")?.startsWith(probe)).toBe(true);
+    }
+  );
+
   test("config values are overrides too", async () => {
     await runAudit(
       ["--level", "surface"],
@@ -252,6 +282,7 @@ describe("squirrel audit --level", () => {
       "custom (surface + external_links off, probe passive) · max 100 pages"
     );
     expect(runs[0]?.externalLinksEnabled).toBe(false);
+    expect(runs[0]?.probe?.level).toBe("passive");
   });
 
   test("the defaults `squirrel init` writes do not make a level custom", async () => {
@@ -273,7 +304,7 @@ describe("squirrel audit --level", () => {
       "--no-internal-links",
     ]);
     expect(line("Level")).toBe(
-      "custom (surface + external_links off) · max 100 pages"
+      "custom (surface + external_links off, probe passive) · max 100 pages"
     );
     expect(runs[0]?.externalLinksEnabled).toBe(false);
     expect(runs[0]?.internalLinksEnabled).toBe(false);
@@ -309,7 +340,7 @@ describe("squirrel audit --level", () => {
       await runAudit(["--level", "surface", ...flags]);
       expect(process.exitCode).toBe(0);
       expect(line("Level")).toBe(
-        "custom (surface + external_links off) · max 100 pages"
+        "custom (surface + external_links off, probe passive) · max 100 pages"
       );
       expect(runs[0]?.externalLinksEnabled).toBe(false);
     }
@@ -344,7 +375,7 @@ describe("squirrel audit --level", () => {
     runs = [];
     output = [];
     await runAudit([], '[crawler]\ncoverage = "full"\n');
-    expect(line("Level")).toBe("full · max 500 pages");
+    expect(line("Level")).toBe("custom (full + probe passive) · max 500 pages");
   });
 
   test("an unknown level is refused before any request, naming the levels", async () => {
@@ -395,7 +426,7 @@ describe("squirrel audit --level", () => {
     expect(json.meta.auditLevel).toMatchObject({
       level: "custom",
       basedOn: "surface",
-      changes: ["pages"],
+      changes: ["pages", "probe"],
     });
   });
 });

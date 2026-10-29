@@ -19,6 +19,7 @@ How it works:
 
 ### Fixed
 
+- `squirrel audit --offline` now defaults probing to `passive` at every audit level, so a surface or full offline audit sends no same-site security probe requests beyond its crawl unless `--probe`, `--passive`, `--aggressive` or `--pentest` explicitly opts in. The run banner shows the resolved probing level. (#1225)
 - `squirrel audit --offline` now treats a non-localhost start URL that redirects off-site as reachable, so the crawl can record the redirect instead of stopping at the preflight probe with `refused: host outside the allowed set`. This also covers link-shortener and sibling-host redirects. (#1224)
 - `eeat/about-page` and `eeat/contact-page` now recognise an in-page About or Contact section in a real audit. The v0.0.139 change (#1208) only worked where a page's DOM was still available, which the streaming engine, the one the CLI and the cloud run, does not provide to site rules, so a one-page site still read "No About page found". The section is now collected from each page while its DOM is live. An engine-level test runs the one-page fixture through the streaming engine (#1236).
 

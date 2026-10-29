@@ -113,7 +113,10 @@ beforeEach(() => {
     if (url.pathname === "/" || url.pathname === "") {
       return new Response(
         "<html><head><title>t</title></head><body><h1>h</h1></body></html>",
-        { status: 200, headers: { "Content-Type": "text/html" } }
+        {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        }
       );
     }
     return new Response("not found", { status: 404 });
@@ -181,8 +184,17 @@ describe("squirrel audit probing intensity", () => {
     expect(probes[0]?.allows("loud")).toBe(false);
   });
 
-  test("[security] probe and budget are read from config", async () => {
+  test("offline overrides [security] probe but keeps its budget for an explicit level", async () => {
     await runAudit([], '[security]\nprobe = "active"\nbudget = "45s"\n');
+    expect(line("Probing")).toBe("passive · no requests beyond the crawl");
+    expect(probes[0]?.budgetMs).toBe(0);
+
+    probes = [];
+    output = [];
+    await runAudit(
+      ["--probe", "active"],
+      '[security]\nprobe = "aggressive"\nbudget = "45s"\n'
+    );
     expect(line("Probing")).toBe("active · budget 45s");
     expect(probes[0]?.budgetMs).toBe(45_000);
   });
@@ -200,7 +212,7 @@ describe("squirrel audit probing intensity", () => {
 
   test("--probe-budget beats [security] budget", async () => {
     await runAudit(
-      ["--probe-budget", "10s"],
+      ["--probe", "active", "--probe-budget", "10s"],
       '[security]\nprobe = "active"\nbudget = "45s"\n'
     );
     expect(probes[0]?.budgetMs).toBe(10_000);
