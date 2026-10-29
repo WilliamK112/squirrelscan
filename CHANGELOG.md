@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Added
+
+- Technology detection recognises Lovable, Base44, Replit and v0 apps, and the Supabase, Clerk and Firebase client SDKs. Each reads only what a stored page holds: generator and author meta tags, platform script URLs, app hosts such as `*.base44.app` or `*.replit.app`, inline client config, and storage image URLs. A page that only mentions a product, links to one of its assets or shows its code in a sample does not match, and a Base44 app is not also reported as Supabase for the shared storage it loads images from. The existing Firebase Hosting signature is unchanged. See [Technology detection](https://docs.squirrelscan.com/cloud/technologies). (#1242)
+
 ### Fixed
 
 - **Leaked-secret checks no longer flag credential key-name constants as values.** A bundle constant such as `DROPBOX_ACCESS_TOKEN: "dropbox-access-token"` is recognised as a storage or configuration identifier, while random credential-shaped assignments still report. (#1228)
