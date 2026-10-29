@@ -39,11 +39,29 @@ const INPUT = join(ROOT, "packages/tech-detect/data/research-fingerprints.json")
 const OUTPUT = join(ROOT, "packages/tech-detect/src/fingerprints/generated.ts");
 
 const VALID_CATEGORIES = new Set([
-  "cms", "framework", "analytics", "cdn", "ad-network", "payment", "web-server",
-  "hosting", "security", "tag-manager", "chat", "font", "video", "widget", "other",
+  "cms",
+  "framework",
+  "analytics",
+  "cdn",
+  "ad-network",
+  "payment",
+  "web-server",
+  "hosting",
+  "security",
+  "tag-manager",
+  "chat",
+  "font",
+  "video",
+  "widget",
+  "other",
 ]);
 const DETECTOR_TYPES = new Set([
-  "header", "meta", "script-url", "script-content", "html", "url-path",
+  "header",
+  "meta",
+  "script-url",
+  "script-content",
+  "html",
+  "url-path",
 ]);
 
 interface RawDetector {
@@ -68,11 +86,28 @@ interface RawCategory {
   fingerprints: RawFingerprint[];
 }
 
+// A missing `>` can make an attribute scan backtrack across an entire document
+// for every repeated opener. Keep generated tag scans within a realistic
+// attribute span so a later research-data refresh cannot reintroduce that cost.
+function boundTagAttributeScan(pattern: string): string {
+  return pattern.replace(/(<(?:script|link|meta|img)(?:\\b)?)\[\^>\][*+]/gi, "$1[^>]{0,300}");
+}
+
 // ── Collect curated ids (dedupe target) ───────────────────────────
 const CURATED = [
-  CMS_FINGERPRINTS, FRAMEWORK_FINGERPRINTS, ANALYTICS_FINGERPRINTS, CDN_FINGERPRINTS,
-  SERVER_FINGERPRINTS, HOSTING_FINGERPRINTS, TAG_MANAGER_FINGERPRINTS, PAYMENT_FINGERPRINTS,
-  CHAT_FINGERPRINTS, AD_FINGERPRINTS, SECURITY_FINGERPRINTS, FONT_FINGERPRINTS, OTHER_FINGERPRINTS,
+  CMS_FINGERPRINTS,
+  FRAMEWORK_FINGERPRINTS,
+  ANALYTICS_FINGERPRINTS,
+  CDN_FINGERPRINTS,
+  SERVER_FINGERPRINTS,
+  HOSTING_FINGERPRINTS,
+  TAG_MANAGER_FINGERPRINTS,
+  PAYMENT_FINGERPRINTS,
+  CHAT_FINGERPRINTS,
+  AD_FINGERPRINTS,
+  SECURITY_FINGERPRINTS,
+  FONT_FINGERPRINTS,
+  OTHER_FINGERPRINTS,
 ];
 const existingIds = new Set<string>();
 for (const arr of CURATED) for (const fp of arr) existingIds.add(fp.id);
@@ -94,12 +129,13 @@ function regexLiteral(source: string, caseSensitive?: boolean): string {
 
 function sanitizeDetector(d: RawDetector): string | null {
   if (!DETECTOR_TYPES.has(d.type)) return null; // drops `dom` + unknowns
+  const pattern = d.pattern == null ? undefined : boundTagAttributeScan(d.pattern);
   if (d.type === "header" || d.type === "meta") {
-    if (!d.name || !d.pattern || !compiles(d.pattern, "i")) return null;
-    return `{ type: ${JSON.stringify(d.type)}, name: ${JSON.stringify(d.name)}, pattern: ${regexLiteral(d.pattern, d.caseSensitive)} }`;
+    if (!d.name || !pattern || !compiles(pattern, "i")) return null;
+    return `{ type: ${JSON.stringify(d.type)}, name: ${JSON.stringify(d.name)}, pattern: ${regexLiteral(pattern, d.caseSensitive)} }`;
   }
-  if (!d.pattern || !compiles(d.pattern, "i")) return null;
-  return `{ type: ${JSON.stringify(d.type)}, pattern: ${regexLiteral(d.pattern, d.caseSensitive)} }`;
+  if (!pattern || !compiles(pattern, "i")) return null;
+  return `{ type: ${JSON.stringify(d.type)}, pattern: ${regexLiteral(pattern, d.caseSensitive)} }`;
 }
 
 function emitFingerprint(fp: RawFingerprint): string | null {
