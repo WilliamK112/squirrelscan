@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Added
+
+- **`[storage] store_scripts = true` (or `squirrel audit --store-scripts`) keeps the first-party scripts an audit fetched in the content store.** For corpus and research runs that analyse a crawl again later (new secret rules, new technology fingerprints, labelling) without fetching the site again. Each audit indexes its scripts by URL, with the content hash, size, final URL and the pages that load them; identical bundles are stored once; a script over `store_scripts_max_bytes` (default 2 MB) is recorded as skipped with its size, and an audit stores at most `store_scripts_total_bytes` of distinct bytes (default a quarter of `content_store_max_bytes`). The audit's own checks fetch only 10 to 50 of a site's scripts, so with this on it fetches up to `store_scripts_max_scripts` (default 200, at most 500, extra requests only while it is on, bounded to 256 MB of script text and 120 seconds) and warns with how many it left. Off by default: nothing changes unless you set it. Bodies are evicted by the content store's size cap like stored HTML, so raise `content_store_max_bytes` for a corpus. See [Storage configuration](https://docs.squirrelscan.com/configuration/storage#store_scripts). (#1255)
+
 ## v0.0.140 (2026-10-29)
 
 Technology detection now works offline and reads the first-party script bundles of single page apps, so Lovable, Base44, Replit, v0, Supabase, Clerk and Firebase apps are recognised, and its fingerprint patterns are bounded. `squirrel audit` fails with exit code 3 when a WAF or bot manager serves a challenge or block page, and lists the blocked pages. The installers put `squirrel` on your PATH, and the in-page About and Contact check, the offline seed redirect and the keyword-stuffing check are fixed.
