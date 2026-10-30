@@ -9,6 +9,23 @@ interface ParsedCookie {
   sameSite: string | null;
 }
 
+interface PlatformHttpOnlyExemption {
+  platform: string;
+  purpose: string;
+  docsUrl: string;
+}
+
+const PLATFORM_HTTPONLY_EXEMPTIONS: ReadonlyMap<string, PlatformHttpOnlyExemption> = new Map([
+  [
+    "__dpl",
+    {
+      platform: "Lovable",
+      purpose: "deployment routing",
+      docsUrl: "https://lovable.dev/cookie-policy",
+    },
+  ],
+]);
+
 /**
  * Split a (possibly multi-cookie) Set-Cookie header value into individual
  * cookie directives. Cookies can't be safely comma-joined (Expires values
@@ -116,13 +133,40 @@ export const cookieFlagsRule: Rule = {
       }
     }
 
-    const missingHttpOnly = cookies.filter((c) => !c.httpOnly);
+    const platformHttpOnlyCookies = cookies.flatMap((cookie) => {
+      if (cookie.httpOnly) return [];
+      const exemption = PLATFORM_HTTPONLY_EXEMPTIONS.get(cookie.name);
+      return exemption ? [{ cookie, exemption }] : [];
+    });
+    const missingHttpOnly = cookies.filter(
+      (cookie) => !cookie.httpOnly && !PLATFORM_HTTPONLY_EXEMPTIONS.has(cookie.name),
+    );
     if (missingHttpOnly.length > 0) {
       checks.push({
         name: "cookie-httponly",
         status: "warn",
         message: `${missingHttpOnly.length} cookie(s) missing the HttpOnly flag`,
         items: missingHttpOnly.map((c) => ({ id: c.name })),
+      });
+    }
+
+    if (platformHttpOnlyCookies.length > 0) {
+      const platforms = [
+        ...new Set(platformHttpOnlyCookies.map(({ exemption }) => exemption.platform)),
+      ];
+      checks.push({
+        name: "cookie-httponly-platform",
+        status: "info",
+        message: `${platformHttpOnlyCookies.length} known platform cookie(s) from ${platforms.join(", ")} omit HttpOnly for routing or deployment`,
+        items: platformHttpOnlyCookies.map(({ cookie, exemption }) => ({
+          id: cookie.name,
+          label: `${exemption.platform}: ${cookie.name}`,
+          meta: {
+            platform: exemption.platform,
+            purpose: exemption.purpose,
+            docsUrl: exemption.docsUrl,
+          },
+        })),
       });
     }
 

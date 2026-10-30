@@ -67,6 +67,43 @@ describe("security/cookie-flags", () => {
     expect(check?.items?.[0]?.id).toBe("session");
   });
 
+  test("Lovable deployment cookie: reports platform info instead of an HttpOnly warning", () => {
+    const { checks } = cookieFlagsRule.run(
+      ctx("__dpl=deployment-123; Path=/; Secure; SameSite=Lax"),
+    );
+
+    expect(checksByName(checks, "cookie-httponly")).toBeUndefined();
+    const platformCheck = checksByName(checks, "cookie-httponly-platform");
+    expect(platformCheck?.status).toBe("info");
+    expect(platformCheck?.message).toContain("Lovable");
+    expect(platformCheck?.items?.[0]).toMatchObject({
+      id: "__dpl",
+      label: "Lovable: __dpl",
+      meta: {
+        platform: "Lovable",
+        purpose: "deployment routing",
+        docsUrl: "https://lovable.dev/cookie-policy",
+      },
+    });
+  });
+
+  test("session-looking cookie with a high-entropy value still warns without HttpOnly", () => {
+    const { checks } = cookieFlagsRule.run(
+      ctx("session=0123456789abcdef0123456789abcdef; Path=/; Secure; SameSite=Lax"),
+    );
+
+    expect(checksByName(checks, "cookie-httponly")?.items?.[0]?.id).toBe("session");
+    expect(checksByName(checks, "cookie-httponly-platform")).toBeUndefined();
+  });
+
+  test("platform exemption leaves Secure and SameSite checks unchanged", () => {
+    const { checks } = cookieFlagsRule.run(ctx("__dpl=deployment-123; Path=/"));
+
+    expect(checksByName(checks, "cookie-secure")?.items?.[0]?.id).toBe("__dpl");
+    expect(checksByName(checks, "cookie-samesite")?.items?.[0]?.id).toBe("__dpl");
+    expect(checksByName(checks, "cookie-httponly")).toBeUndefined();
+  });
+
   test("missing SameSite: flagged as info (browsers default to Lax)", () => {
     const { checks } = cookieFlagsRule.run(ctx("session=abc123; Path=/; Secure; HttpOnly"));
     const check = checksByName(checks, "cookie-samesite");

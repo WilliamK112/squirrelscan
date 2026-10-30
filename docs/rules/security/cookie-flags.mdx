@@ -16,7 +16,8 @@ The rule reads the `set-cookie` response header of each crawled page, splits it 
 - `cookie-flags` passes when the page sets no cookies at all. Message: `No cookies set on this page`.
 - `cookie-samesite-none-insecure` fails when a cookie declares `SameSite=None` without `Secure`. Message: `1 cookie(s) set SameSite=None without Secure — modern browsers reject this combination`, with the cookie names listed.
 - `cookie-secure` warns when a cookie on an HTTPS page has no `Secure` attribute. Message: `2 cookie(s) missing the Secure flag`. The check is skipped on HTTP pages, where there is no secure connection to pin the cookie to.
-- `cookie-httponly` warns when a cookie has no `HttpOnly` attribute. Message: `2 cookie(s) missing the HttpOnly flag`.
+- `cookie-httponly` warns when a cookie has no `HttpOnly` attribute. Message: `2 cookie(s) missing the HttpOnly flag`. Known hosting-platform routing and deployment cookies are excluded only from this check. The current exemption is Lovable's `__dpl` cookie ([Lovable cookie policy](https://lovable.dev/cookie-policy)).
+- `cookie-httponly-platform` reports info when one of those known platform cookies omits `HttpOnly`. The check names the platform and includes its documentation link. `Secure` and `SameSite` checks still apply to the cookie.
 - `cookie-samesite` reports info when a cookie declares no `SameSite`, or declares it with an empty value such as `SameSite=`. Message: `2 cookie(s) don't explicitly declare SameSite (browsers default to Lax)`.
 - `cookie-flags` passes when cookies were set and none of the above fired. Message: `3 cookie(s) set with Secure, HttpOnly, and SameSite configured correctly`.
 
