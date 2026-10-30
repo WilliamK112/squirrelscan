@@ -17,6 +17,10 @@ How it works:
 
 ## [Unreleased]
 
+### Fixed
+
+- **A successful HTML page with a zero-byte body is no longer omitted from rule results.** It is audited as an empty document, appears in the report, counts toward coverage and scoring, and receives findings such as missing title and H1. (#1314)
+
 ## v0.0.142 (2026-10-30)
 
 `squirrel audit` follows a start URL that redirects, with your consent, and an unreachable start URL now writes a report and exits 5. Pages with no markup no longer fail every DOM rule, a relative sitemap loc no longer breaks the URL rules, labelled menu sections and label elements are counted correctly, and leaked-secret findings carry the matched value's length and offset.
@@ -35,8 +39,6 @@ How it works:
 - **A quote, backslash or bracket in an `id` or `for` no longer breaks the label rules.** `a11y/form-labels`, `form-field-multiple-labels`, `select-name`, `aria-input-field-name`, `aria-toggle-field-name`, `aria-meter-name`, `aria-progressbar-name`, `aria-command-name`, `aria-required-parent`, `aria-required-children` and `security/form-captcha` built CSS selectors from page values and threw `Attribute selector didn't terminate`. They now compare attribute values as plain strings, and a guard test fails if a rule interpolates a value into an attribute selector again. (#1276)
 - **`meta.auditLevel.settings` says what an `--offline` run did.** It reported the level's cloud defaults (`cloudChecks`, `render: "all"`, `externalLinks`) on every offline report, although nothing was rendered or checked in the cloud. An offline run now records those three as off, with `offline: true` beside them, and `level` and `basedOn` still name the level you asked for. The LLM, markdown, text and HTML outputs say the audit ran offline too. (#1275)
 - **An unreachable start URL writes a report and exits `5`.** DNS failure, connect timeout, connection reset or refused and TLS errors used to exit `1` with a line on stderr and no file. With `-f json` (or `xml`, `llm`) the run now writes `{ "status": "unreachable", "statusReasonCode", "statusReason", ... }` to `--output` or stdout, so a batch job can tell a down site from a crash. **Breaking for scripts:** a `blocked` report now always exits `3`, with or without an identified WAF vendor; a bare 403 or 429 used to exit `1`, so a CI step that treats only `1` as failure needs to accept `3` too. See [Unreachable start URLs](https://docs.squirrelscan.com/cli/audit#unreachable-start-urls). (#1269)
-- **A successful HTML page with a zero-byte body is no longer omitted from rule results.** It is audited as an empty document, appears in the report, counts toward coverage and scoring, and receives findings such as missing title and H1. (#1314)
-
 ## v0.0.141 (2026-10-29)
 
 `squirrel audit --ephemeral` uses cloud features for one run and leaves nothing behind: the site is not added to the dashboard, scheduled or published unless you pass `--publish`. `--store-scripts` keeps the first-party scripts an audit fetched in the content store. Keyword-stuffing checks use the measured copy's own script, leaked-secret checks no longer flag credential key-name constants, and CI now rejects edits to tagged CHANGELOG sections.
